@@ -76,6 +76,7 @@ public:
 
         std::vector<string> lidar_topic_vec = {lidar_topic};
         rosbag::View view(bag, rosbag::TopicQuery(lidar_topic_vec));
+        std::uint32_t scan_id = 0;
 
         // 累计读取
         for (const rosbag::MessageInstance &m : view)
@@ -83,8 +84,9 @@ public:
             // 1) Livox 自定义消息（含 line 字段）
             if (auto livox_custom_msg = m.instantiate<livox_ros_driver::CustomMsg>())
             {
+                const std::uint32_t current_scan_id = scan_id++;
                 lidar_type_ = LiDARType::Solid;
-                cloud_input_->reserve(livox_custom_msg->point_num);
+                cloud_input_->reserve(cloud_input_->size() + livox_custom_msg->point_num);
                 for (uint32_t i = 0; i < livox_custom_msg->point_num; ++i)
                 {
                     Common::Point p;
@@ -94,6 +96,7 @@ public:
                     p.intensity = static_cast<float>(livox_custom_msg->points[i].reflectivity);
                     // Livox 的 CustomPoint 有 line 字段（uint8 / uint16 视版本而定）
                     p.ring = static_cast<std::uint16_t>(livox_custom_msg->points[i].line);
+                    p.scan_id = current_scan_id;
                     cloud_input_->push_back(p);
                 }
                 continue;
@@ -102,6 +105,7 @@ public:
             // 2) 机械雷达 / 通用 PointCloud2
             if (auto pcl_msg = m.instantiate<sensor_msgs::PointCloud2>())
             {
+                const std::uint32_t current_scan_id = scan_id++;
                 // 优先判断是否有 ring 字段
                 bool has_ring = false;
                 bool has_intensity = false;
@@ -141,7 +145,7 @@ public:
                 }
 
                 const size_t n = static_cast<size_t>(pcl_msg->width) * pcl_msg->height;
-                cloud_input_->reserve(n);
+                cloud_input_->reserve(cloud_input_->size() + n);
 
                 // cout << "Loading PointCloud2 with " << n << " points. Has ring: " << has_ring << endl;
 
@@ -173,6 +177,7 @@ public:
                     {
                         p.intensity = 0.0f;
                     }
+                    p.scan_id = current_scan_id;
 
                     cloud_input_->push_back(p);
                 }

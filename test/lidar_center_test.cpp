@@ -1,7 +1,7 @@
 /*
 Developer: Chunran Zheng <zhengcr@connect.hku.hk>
 
-LiDAR-only batch test entry for target annulus center extraction.
+Standalone LiDAR-only batch test entry for target annulus center extraction.
 */
 
 #include "data_preprocess.hpp"
@@ -75,6 +75,7 @@ bool loadCloudFromBag(const std::string& bag_path,
                 p.z = livox_custom_msg->points[i].z;
                 p.intensity = static_cast<float>(livox_custom_msg->points[i].reflectivity);
                 p.ring = static_cast<std::uint16_t>(livox_custom_msg->points[i].line);
+                p.scan_id = static_cast<std::uint32_t>(message_count);
                 cloud->push_back(p);
             }
             ++message_count;
@@ -133,6 +134,7 @@ bool loadCloudFromBag(const std::string& bag_path,
                     p.intensity = **it_intensity_ptr;
                     ++(*it_intensity_ptr);
                 }
+                p.scan_id = static_cast<std::uint32_t>(message_count);
 
                 cloud->push_back(p);
             }
@@ -203,23 +205,20 @@ std::string sanitizeFilePart(std::string value)
     return value;
 }
 
-// 确保输出目录存在
-void ensureDirectory(const std::string& path)
-{
-    if (path.empty()) return;
-    mkdir(path.c_str(), 0755);
-}
-
 // 解析测试输出目录，兼容未展开的 ROS launch 变量
 std::string resolveOutputDirectory(const Params& params)
 {
     std::string output_dir = params.output_path;
     if (output_dir.empty() || output_dir.find("$(") != std::string::npos)
     {
-        output_dir = "/home/chunran/02_calib_ws/src/FAST-Calib/output";
+        output_dir = "/tmp/fast_calib_output";
     }
     output_dir = trimTrailingSlash(output_dir);
-    ensureDirectory(output_dir);
+    std::string error;
+    if (!ensureDirectoryTree(output_dir, error))
+    {
+        ROS_ERROR_STREAM("[LiDAR Test] " << error);
+    }
     return output_dir;
 }
 
@@ -414,6 +413,12 @@ bool saveDebugCloud(const pcl::PointCloud<Common::Point>::Ptr& board_cloud,
     for (size_t i = 0; i < centers->size(); ++i)
     {
         addCenterMarker(centers->points[i], center_color, debug_cloud);
+    }
+
+    if (debug_cloud->empty())
+    {
+        ROS_WARN_STREAM("[LiDAR Test] Skip saving empty debug cloud for " << bag_path);
+        return false;
     }
 
     debug_cloud->width = static_cast<uint32_t>(debug_cloud->size());
@@ -685,7 +690,8 @@ int main(int argc, char** argv)
 
     if (argc < 3)
     {
-        std::cerr << "Usage: rosrun fast_calib lidar_center_test <bag_path> <lidar_topic> [auto|solid|mech]" << std::endl;
+        std::cerr << "Usage: rosrun fast_calib lidar_center_test <bag_path> <lidar_topic> "
+                     "[auto|solid|mech] [forward_axis up_axis]" << std::endl;
         return 2;
     }
 
@@ -694,6 +700,25 @@ int main(int argc, char** argv)
     params.lidar_topic = argv[2];
 
     const std::string mode = argc >= 4 ? argv[3] : "auto";
+    if (argc == 5 || argc > 6)
+    {
+        std::cerr << "Both forward_axis and up_axis must be provided, for example: +x -y" << std::endl;
+        return 2;
+    }
+    if (argc == 6)
+    {
+        params.lidar_forward_axis = argv[4];
+        params.lidar_up_axis = argv[5];
+    }
+
+    std::string mounting_error;
+    if (!validateLidarMountAxes(params.lidar_forward_axis, params.lidar_up_axis,
+                                mounting_error))
+    {
+        ROS_ERROR_STREAM("[LiDAR Test] Invalid LiDAR mounting-axis configuration: "
+                         << mounting_error);
+        return 2;
+    }
 
     pcl::PointCloud<Common::Point>::Ptr cloud(new pcl::PointCloud<Common::Point>);
     LiDARType detected_type = LiDARType::Unknown;
@@ -729,7 +754,12 @@ int main(int argc, char** argv)
     }
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr centers(new pcl::PointCloud<pcl::PointXYZ>);
-    sortPatternCenters(raw_centers, centers, "lidar");
+    if (!sortPatternCenters(raw_centers, centers, "lidar",
+                            params.lidar_forward_axis, params.lidar_up_axis))
+    {
+        ROS_ERROR("[LiDAR Test] Failed to sort target centers. Check forward_axis/up_axis.");
+        return 1;
+    }
 
     std::cout << "[LiDAR Test] Raw center count: " << raw_centers->size() << std::endl;
     std::cout << "[LiDAR Test] Sorted center count: " << centers->size() << std::endl;

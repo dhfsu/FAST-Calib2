@@ -56,7 +56,7 @@ Solid-state LiDAR pipeline:
 
 Mechanical LiDAR pipeline:
 
-1. Use LiDAR `ring` order to find intensity transition points on the annulus boundary.
+1. Use LiDAR ring order within each scan to find intensity transition points on the annulus boundary.
 2. Try both interpolated boundary points and high-reflectivity-side boundary points.
 3. Cluster the extracted boundary points.
 4. Fit fixed inner/outer radius concentric circles.
@@ -70,6 +70,15 @@ Prepare static acquisition data in the `calib_data` folder (Download the example
 
 - rosbag containing point cloud messages
 - corresponding image
+
+Describe the LiDAR mounting in `config/qr_params.yaml`:
+
+```yaml
+lidar_forward_axis: "+x"
+lidar_up_axis: "+z"
+```
+
+The axis values must be signed, perpendicular axes such as `+x` and `-y`.
 
 Run single-scene calibration:
 
@@ -101,15 +110,15 @@ Load parameters:
 
 ```bash
 rosparam load config/qr_params.yaml /
-rosparam set /output_path /home/chunran/02_calib_ws/src/FAST-Calib/output
+rosparam set /output_path "$(rospack find fast_calib)/output"
 ```
 
 Run solid-state LiDAR data:
 
 ```bash
-rosrun fast_calib lidar_center_test calib_data/fast-calib2-data/left.bag /livox/lidar solid
-rosrun fast_calib lidar_center_test calib_data/fast-calib2-data/mid.bag /livox/lidar solid
-rosrun fast_calib lidar_center_test calib_data/fast-calib2-data/right.bag /livox/lidar solid
+rosrun fast_calib lidar_center_test calib_data/avia/left.bag /livox/lidar solid
+rosrun fast_calib lidar_center_test calib_data/avia/mid.bag /livox/lidar solid
+rosrun fast_calib lidar_center_test calib_data/avia/right.bag /livox/lidar solid
 ```
 
 Run mechanical LiDAR data:

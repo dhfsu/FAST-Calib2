@@ -16,6 +16,55 @@ int main(int argc, char **argv)
 
     // 读取参数
     Params params = loadParameters(nh);
+    std::string mounting_error;
+    if (!validateLidarMountAxes(params.lidar_forward_axis, params.lidar_up_axis,
+                                mounting_error))
+    {
+      ROS_ERROR_STREAM("[Main] Invalid LiDAR mounting-axis configuration: "
+                       << mounting_error);
+      return 1;
+    }
+
+    std::string output_error;
+    if (!ensureDirectoryTree(params.output_path, output_error))
+    {
+      ROS_ERROR_STREAM("[Main] Invalid output directory: " << output_error);
+      return 1;
+    }
+
+    // Load the inputs before constructing detectors so camera calibration can
+    // be checked against the actual image resolution.
+    DataPreprocessPtr dataPreprocessPtr;
+    dataPreprocessPtr.reset(new DataPreprocess(params));
+
+    // 读取图像和点云
+    cv::Mat img_input = dataPreprocessPtr->img_input_;
+    pcl::PointCloud<Common::Point>::Ptr cloud_input = dataPreprocessPtr->cloud_input_;
+    if (img_input.empty())
+    {
+      ROS_ERROR_STREAM("[Main] Image is empty. Check image_path: " << params.image_path);
+      return 1;
+    }
+    if (!cloud_input || cloud_input->empty())
+    {
+      ROS_ERROR_STREAM("[Main] Point cloud is empty. Check bag_path and lidar_topic: "
+                       << params.bag_path << ", " << params.lidar_topic);
+      return 1;
+    }
+    if (dataPreprocessPtr->lidar_type_ == LiDARType::Unknown)
+    {
+      ROS_ERROR_STREAM("[Main] Unknown LiDAR message type. Check lidar_topic: "
+                       << params.lidar_topic);
+      return 1;
+    }
+
+    std::string camera_error;
+    if (!validateCameraCalibrationForImage(params, img_input.cols, img_input.rows,
+                                           camera_error))
+    {
+      ROS_ERROR_STREAM("[Main] Invalid camera calibration: " << camera_error);
+      return 1;
+    }
 
     // 初始化 QR 检测和 LiDAR 检测
     QRDetectPtr qrDetectPtr;
@@ -23,18 +72,17 @@ int main(int argc, char **argv)
 
     LidarDetectPtr lidarDetectPtr;
     lidarDetectPtr.reset(new LidarDetect(nh, params));
-
-    DataPreprocessPtr dataPreprocessPtr;
-    dataPreprocessPtr.reset(new DataPreprocess(params));
-
-    // 读取图像和点云
-    cv::Mat img_input = dataPreprocessPtr->img_input_;
-    pcl::PointCloud<Common::Point>::Ptr cloud_input = dataPreprocessPtr->cloud_input_;
     
     // 检测 QR 码
     PointCloud<PointXYZ>::Ptr qr_center_cloud(new PointCloud<PointXYZ>);
     qr_center_cloud->reserve(4);
     qrDetectPtr->detect_qr(img_input, qr_center_cloud);
+    if (qr_center_cloud->size() != TARGET_NUM_CIRCLES)
+    {
+      ROS_ERROR_STREAM("[Main] Expected " << TARGET_NUM_CIRCLES
+                       << " camera target centers, got " << qr_center_cloud->size() << ".");
+      return 1;
+    }
 
     // 检测 LiDAR 数据
     PointCloud<PointXYZ>::Ptr lidar_center_cloud(new PointCloud<PointXYZ>);
@@ -56,12 +104,23 @@ int main(int argc, char **argv)
                     << RESET << std::endl;
             break;
     }
+    if (lidar_center_cloud->size() != TARGET_NUM_CIRCLES)
+    {
+      ROS_ERROR_STREAM("[Main] Expected " << TARGET_NUM_CIRCLES
+                       << " LiDAR target centers, got " << lidar_center_cloud->size() << ".");
+      return 1;
+    }
 
     // 对 QR 和 LiDAR 检测到的圆心进行排序
     PointCloud<PointXYZ>::Ptr qr_centers(new PointCloud<PointXYZ>);
     PointCloud<PointXYZ>::Ptr lidar_centers(new PointCloud<PointXYZ>);
-    sortPatternCenters(qr_center_cloud, qr_centers, "camera");
-    sortPatternCenters(lidar_center_cloud, lidar_centers, "lidar");
+    if (!sortPatternCenters(qr_center_cloud, qr_centers, "camera") ||
+        !sortPatternCenters(lidar_center_cloud, lidar_centers, "lidar",
+                            params.lidar_forward_axis, params.lidar_up_axis))
+    {
+      ROS_ERROR("[Main] Failed to sort target centers. Check the LiDAR mounting-axis configuration.");
+      return 1;
+    }
 
     validateTargetGeometry(qr_centers, params.delta_width_circles, params.delta_height_circles, "QR");
     validateTargetGeometry(lidar_centers, params.delta_width_circles, params.delta_height_circles, "LiDAR");

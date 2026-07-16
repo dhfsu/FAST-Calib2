@@ -1,43 +1,7 @@
-# Camera intrinsics  
-  # mid360
-  # fx: 843.501050605967
-  # fy: 845.199690011973
-  # cx: 321.017429415352
-  # cy: 239.294896816737
-  # k1: -0.465219389887045
-  # k2: 0.237050091701749
-  # p1: 0.00521922785740506
-  # p2: 0.000418186016514835
-
-  # avia
-  # fx: 1215.31801774424
-  # fy: 1214.72961288138
-  # cx: 1047.86571859677
-  # cy: 745.068353101898
-  # k1: -0.33574781188503
-  # k2: 0.10996870793601
-  # p1: 0.000157303079833973
-  # p2: 0.000544930726278493
-
-  # ouster
-  # fx: 1466.16500795563
-  # fy: 1465.32657394431
-  # cx: 1214.39964380518
-  # cy: 1010.97681425650
-  # k1: -0.0458344972140773
-  # k2: 0.0896961240772692
-  # p1: -0.000731746350601389
-  # p2: -0.000201478932371979
-
-  # multi-scene
-  # fx: 2478.48702288166
-  # fy: 2478.58544825456
-  # cx: 1230.99707596681
-  # cy: 1025.66149498072
-  # k1: -0.0493178189623200
-  # k2: 0.147394487986097
-  # p1: -0.00127118592043482
-  # p2: -0.00200379689523022
+# Camera intrinsics
+  # Resolution used when calibrating the active intrinsics below.
+  camera_width: 2448
+  camera_height: 2048
   fx: 2364.049767406230
   fy: 2368.875165893467
   cx: 1211.209298385360
@@ -48,7 +12,7 @@
   p2: 0.0006409200928440982
 
 # Calibration target parameters
-  marker_size: 0.20 # ArUco marker size (our test data uses 0.16m; adjust to match your marker size)
+  marker_size: 0.20 # ArUco marker side length; adjust to match your physical target
   delta_width_qr_center: 0.55 # Half the distance between the centers of two markers in the horizontal direction 
   delta_height_qr_center: 0.35 # Half the distance between the centers of two markers in the vertical direction
   delta_width_circles: 0.5 # Distance between the centers of two annuli in the horizontal direction
@@ -61,44 +25,19 @@
   board_roi_depth: 0.12
   auto_roi_voxel_leaf: 0.01
   annulus_voxel_leaf: 0.005
-
-# Distance filter
-  # x_min: 3.0 # avia and mid360: 2.0 ouster: 1.5
-  # x_max: 5.0
-  # y_min: -0.5
-  # y_max: 3.0
-  # z_min: 0.0 # avia and mid360: -0.5 ouster: -0.8
-  # z_max: 2.0
-
-# multi_scene_11
-  # x_min: 2.0
-  # x_max: 5.0
-  # y_min: -1.0
-  # y_max: 1.0
-  # z_min: 0.0
-  # z_max: 2.0
-# multi_scene_22
-  # x_min: 2.0
-  # x_max: 5.0
-  # y_min: -4.0
-  # y_max: 1.0
-  # z_min: 0.0
-  # z_max: 2.0
+  auto_roi_geometry_max_error: 0.10
 
   use_auto_lidar_roi: true
 
-# multi_scene_33
-  x_min: 2.6
-  x_max: 3.0
-  y_min: -1.0
-  y_max: 0.8
-  z_min: -0.3
-  z_max: 1.1
-
 # Input
-  lidar_topic: "/livox/lidar" # /ouster/points /livox/lidar
-  bag_path: "$(find fast_calib)/calib_data/fast-calib2-data/mid.bag"
-  image_path: "$(find fast_calib)/calib_data/fast-calib2-data/mid.bmp"
+  # LiDAR mounting axes. Each value answers which signed native LiDAR axis
+  # points in that physical direction. Left is derived as up x forward.
+  # Bundled AVIA data uses the standard +X-forward, +Y-left, +Z-up mounting.
+  lidar_forward_axis: "+x"
+  lidar_up_axis: "+z"
+  lidar_topic: "/livox/lidar"
+  bag_path: "$(find fast_calib)/calib_data/avia/mid.bag"
+  image_path: "$(find fast_calib)/calib_data/avia/mid.bmp"
 
 # Output
   output_path: "$(find fast_calib)/output"

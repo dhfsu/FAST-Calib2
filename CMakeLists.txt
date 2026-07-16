@@ -37,7 +37,10 @@ target_link_libraries(fast_calib
   ${OpenCV_LIBRARIES}
 )
 
-add_executable(lidar_center_test src/lidar_center_test.cpp)
+add_executable(lidar_center_test test/lidar_center_test.cpp)
+target_include_directories(lidar_center_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
 target_link_libraries(lidar_center_test
   ${catkin_LIBRARIES}
@@ -51,3 +54,14 @@ target_link_libraries(multi_fast_calib
   ${PCL_LIBRARIES}
   ${OpenCV_LIBRARIES}
 )
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(common_lib_test test/common_lib_test.cpp)
+  if(TARGET common_lib_test)
+    target_link_libraries(common_lib_test
+      ${catkin_LIBRARIES}
+      ${PCL_LIBRARIES}
+      ${OpenCV_LIBRARIES}
+    )
+  endif()
+endif()

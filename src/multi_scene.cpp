@@ -113,10 +113,16 @@ int main(int argc, char** argv)
     ros::NodeHandle nh;
     Params params = loadParameters(nh);
 
+    std::string output_error;
+    if (!ensureDirectoryTree(params.output_path, output_error))
+    {
+        ROS_ERROR("Invalid output directory: %s", output_error.c_str());
+        return 1;
+    }
+
     if (params.output_path.back() != '/') params.output_path += '/';
     std::string midtxt_path = params.output_path + "circle_center_record.txt";
 
-    if (params.output_path.back() != '/') params.output_path += '/';
     std::string multi_output_path = params.output_path + "multi_calib_result.txt";
 
     // 读取全部行

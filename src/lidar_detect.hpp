@@ -17,8 +17,11 @@ which is included as part of this source code package.
 #include <pcl/features/boundary.h>
 #include <pcl/features/normal_3d.h>
 #include "common_lib.h"
+#include <array>
 #include <limits>
+#include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 class LidarDetect
 {
@@ -26,7 +29,7 @@ private:
     double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_;
     double circle_radius_, annulus_half_width_, delta_width_circles_, delta_height_circles_;
     double board_width_, board_height_, board_roi_margin_, board_roi_depth_;
-    double auto_roi_voxel_leaf_, annulus_voxel_leaf_;
+    double auto_roi_voxel_leaf_, annulus_voxel_leaf_, auto_roi_geometry_max_error_;
     bool use_auto_lidar_roi_;
 
     // 存储中间结果的点云
@@ -56,6 +59,17 @@ private:
         double mean_abs_error = std::numeric_limits<double>::max();
         double rmse = std::numeric_limits<double>::max();
         int support = 0;
+        bool valid = false;
+    };
+
+    struct TemplateFitResult
+    {
+        double x = 0.0;
+        double y = 0.0;
+        double theta = 0.0;
+        double score = std::numeric_limits<double>::max();
+        int support = 0;
+        std::array<int, TARGET_NUM_CIRCLES> support_by_center = {{0, 0, 0, 0}};
         bool valid = false;
     };
 
@@ -364,6 +378,18 @@ private:
 
         if (label == "Annulus")
         {
+            const bool low_contrast_annulus = (max_i - min_i) < 120.0f;
+            if (low_contrast_annulus)
+            {
+                const float fallback_threshold = std::max(otsu_threshold, foreground_low);
+                if (threshold > fallback_threshold)
+                {
+                    ROS_WARN("[LiDAR] %s threshold %.3f is too selective for low-contrast returns; fallback to %.3f.",
+                             label.c_str(), threshold, fallback_threshold);
+                    threshold = fallback_threshold;
+                }
+            }
+
             const bool saturated_foreground =
                 max_i > 200.0f &&
                 foreground_low > max_i - 1.0f &&
@@ -544,26 +570,49 @@ private:
                                              foreground_low, high_quantile,
                                              threshold);
 
-        std::unordered_map<std::uint16_t, std::vector<int>> indices_by_ring;
-        indices_by_ring.reserve(128);
+        // A rosbag usually contains many complete scans.  Keep scan boundaries
+        // while grouping by ring; sorting all scans of one ring together creates
+        // false intensity transitions between measurements from different frames.
+        std::unordered_map<std::uint64_t, std::vector<int>> indices_by_scan_ring;
+        std::unordered_set<std::uint16_t> unique_rings;
+        std::unordered_set<std::uint32_t> unique_scans;
+        indices_by_scan_ring.reserve(4096);
         for (int i = 0; i < static_cast<int>(input->size()); ++i)
         {
             const auto& p = input->points[i];
             if (!isFinitePoint(p)) continue;
             if (planeDistance(plane_coefficients, p) >= plane_distance_threshold) continue;
-            indices_by_ring[p.ring].push_back(i);
+            const std::uint64_t key =
+                (static_cast<std::uint64_t>(p.scan_id) << 16) |
+                static_cast<std::uint64_t>(p.ring);
+            indices_by_scan_ring[key].push_back(i);
+            unique_rings.insert(p.ring);
+            unique_scans.insert(p.scan_id);
         }
 
         const double max_neighbor_distance = 0.12;
-        const float jump_threshold = std::max(12.0f, 0.08f * (max_i - min_i));
+        const float intensity_range = max_i - min_i;
+        const float min_jump_threshold = intensity_range < 120.0f ? 3.0f : 12.0f;
+        const float jump_threshold = std::max(min_jump_threshold, 0.08f * intensity_range);
         size_t transition_count = 0;
         size_t valid_neighbor_count = 0;
         output->reserve(input->size() / 20);
 
-        for (const auto& kv : indices_by_ring)
+        for (const auto& kv : indices_by_scan_ring)
         {
-            const auto& indices = kv.second;
+            std::vector<int> indices = kv.second;
             if (indices.size() < 2) continue;
+
+            // Some PointCloud2 producers do not preserve scan order within a ring.
+            // Boundary extraction depends on neighboring laser returns, so enforce
+            // an azimuth order before looking for intensity transitions.
+            std::sort(indices.begin(), indices.end(),
+                      [&](int a, int b)
+                      {
+                          const auto& pa = input->points[a];
+                          const auto& pb = input->points[b];
+                          return std::atan2(pa.y, pa.x) < std::atan2(pb.y, pb.x);
+                      });
 
             for (size_t k = 1; k < indices.size(); ++k)
             {
@@ -603,6 +652,7 @@ private:
                     boundary_point.z = low_point.z + alpha * (high_point.z - low_point.z);
                     boundary_point.intensity = threshold;
                     boundary_point.ring = low_point.ring;
+                    boundary_point.scan_id = low_point.scan_id;
                 }
                 else
                 {
@@ -616,8 +666,9 @@ private:
         ROS_INFO("[LiDAR] %s ring-boundary Otsu: %.3f, foreground p15: %.3f, p92: %.3f, relative high: %.3f, threshold: %.3f, jump threshold: %.3f",
                  label.c_str(), otsu_threshold, foreground_low, high_quantile,
                  relative_high, threshold, jump_threshold);
-        ROS_INFO("[LiDAR] %s ring-boundary rings: %zu, valid neighbors: %zu, transitions: %zu, boundary points: %zu",
-                 label.c_str(), indices_by_ring.size(), valid_neighbor_count,
+        ROS_INFO("[LiDAR] %s ring-boundary scans: %zu, rings: %zu, scan-ring groups: %zu, valid neighbors: %zu, transitions: %zu, boundary points: %zu",
+                 label.c_str(), unique_scans.size(), unique_rings.size(),
+                 indices_by_scan_ring.size(), valid_neighbor_count,
                  transition_count, output->size());
         ROS_INFO("[LiDAR] %s ring-boundary point mode: %s",
                  label.c_str(), interpolate_boundary ? "interpolated crossing" : "high-reflectivity side");
@@ -955,6 +1006,300 @@ private:
         return result.valid;
     }
 
+    // 根据已知四环几何，直接在板平面内拟合整块 annulus 模板。
+    // 这个 fallback 处理机械 LiDAR 上只有稀疏弧段、单圆拟合退化的情况。
+    std::array<Eigen::Vector2d, TARGET_NUM_CIRCLES> templateCenters(double x,
+                                                                    double y,
+                                                                    double theta) const
+    {
+        const auto local = templateLocalCenters();
+        const double c = std::cos(theta);
+        const double s = std::sin(theta);
+        std::array<Eigen::Vector2d, TARGET_NUM_CIRCLES> centers;
+        for (int i = 0; i < TARGET_NUM_CIRCLES; ++i)
+        {
+            centers[i] = Eigen::Vector2d(x + c * local[i].x() - s * local[i].y(),
+                                         y + s * local[i].x() + c * local[i].y());
+        }
+        return centers;
+    }
+
+    std::array<Eigen::Vector2d, TARGET_NUM_CIRCLES> templateLocalCenters() const
+    {
+        const double hw = 0.5 * delta_width_circles_;
+        const double hh = 0.5 * delta_height_circles_;
+        return {{
+            Eigen::Vector2d(-hw, -hh),
+            Eigen::Vector2d(-hw,  hh),
+            Eigen::Vector2d( hw,  hh),
+            Eigen::Vector2d( hw, -hh)
+        }};
+    }
+
+    double annulusTemplateScore(const std::vector<Eigen::Vector2d>& points,
+                                double x,
+                                double y,
+                                double theta,
+                                TemplateFitResult& result) const
+    {
+        result = TemplateFitResult();
+        result.x = x;
+        result.y = y;
+        result.theta = theta;
+
+        const auto centers = templateCenters(x, y, theta);
+        // The point must remain close to the configured annulus band.  A broad
+        // gate makes unrelated clutter look like valid template support.
+        const double support_gate = annulus_half_width_ + 0.025;
+        double sq_error = 0.0;
+
+        for (const auto& p : points)
+        {
+            int best_center = -1;
+            double best_radial_error = std::numeric_limits<double>::max();
+            for (int i = 0; i < TARGET_NUM_CIRCLES; ++i)
+            {
+                const double dx = p.x() - centers[i].x();
+                const double dy = p.y() - centers[i].y();
+                const double radius = std::sqrt(dx * dx + dy * dy);
+                if (!std::isfinite(radius)) continue;
+                const double radial_error = std::fabs(radius - circle_radius_);
+                if (radial_error < best_radial_error)
+                {
+                    best_radial_error = radial_error;
+                    best_center = i;
+                }
+            }
+
+            if (best_center < 0 || best_radial_error > support_gate) continue;
+            const double band_error = std::max(0.0, best_radial_error - annulus_half_width_);
+            sq_error += band_error * band_error;
+            ++result.support;
+            ++result.support_by_center[best_center];
+        }
+
+        if (result.support == 0) return std::numeric_limits<double>::max();
+        const double mean_error = sq_error / static_cast<double>(result.support);
+        const double support_ratio = static_cast<double>(result.support) /
+                                     static_cast<double>(std::max<size_t>(1, points.size()));
+        result.score = mean_error + 0.0025 * std::max(0.0, 0.65 - support_ratio);
+        return result.score;
+    }
+
+    bool fitAnnulusTemplateCentersFromPoints(const pcl::PointCloud<pcl::PointXYZ>::Ptr& points,
+                                             pcl::PointCloud<pcl::PointXYZ>::Ptr candidate_centers) const
+    {
+        candidate_centers->clear();
+        if (!points || points->size() < 80) return false;
+
+        std::vector<Eigen::Vector2d> all_points;
+        all_points.reserve(points->size());
+        double min_x = std::numeric_limits<double>::max();
+        double min_y = std::numeric_limits<double>::max();
+        double max_x = -std::numeric_limits<double>::max();
+        double max_y = -std::numeric_limits<double>::max();
+        for (const auto& p : *points)
+        {
+            if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
+            all_points.emplace_back(p.x, p.y);
+            min_x = std::min(min_x, static_cast<double>(p.x));
+            min_y = std::min(min_y, static_cast<double>(p.y));
+            max_x = std::max(max_x, static_cast<double>(p.x));
+            max_y = std::max(max_y, static_cast<double>(p.y));
+        }
+        if (all_points.size() < 80) return false;
+
+        std::vector<Eigen::Vector2d> sample_points;
+        const size_t stride = std::max<size_t>(1, all_points.size() / 5000);
+        sample_points.reserve((all_points.size() + stride - 1) / stride);
+        for (size_t i = 0; i < all_points.size(); i += stride)
+        {
+            sample_points.push_back(all_points[i]);
+        }
+
+        const double seed_x = 0.5 * (min_x + max_x);
+        const double seed_y = 0.5 * (min_y + max_y);
+        TemplateFitResult best;
+        TemplateFitResult current;
+
+        for (double theta = 0.0; theta < M_PI; theta += M_PI / 36.0)
+        {
+            for (double dx = -0.45; dx <= 0.4501; dx += 0.04)
+            {
+                for (double dy = -0.45; dy <= 0.4501; dy += 0.04)
+                {
+                    annulusTemplateScore(sample_points, seed_x + dx, seed_y + dy, theta, current);
+                    if (current.score < best.score)
+                    {
+                        best = current;
+                    }
+                }
+            }
+        }
+
+        for (double theta = best.theta - M_PI / 36.0;
+             theta <= best.theta + M_PI / 36.0 + 1e-9;
+             theta += M_PI / 180.0)
+        {
+            double normalized_theta = theta;
+            while (normalized_theta < 0.0) normalized_theta += M_PI;
+            while (normalized_theta >= M_PI) normalized_theta -= M_PI;
+            for (double dx = -0.06; dx <= 0.0601; dx += 0.01)
+            {
+                for (double dy = -0.06; dy <= 0.0601; dy += 0.01)
+                {
+                    annulusTemplateScore(sample_points, best.x + dx, best.y + dy,
+                                         normalized_theta, current);
+                    if (current.score < best.score)
+                    {
+                        best = current;
+                    }
+                }
+            }
+        }
+
+        annulusTemplateScore(all_points, best.x, best.y, best.theta, best);
+        const int min_center_support = 40;
+        for (int i = 0; i < TARGET_NUM_CIRCLES; ++i)
+        {
+            if (best.support_by_center[i] < min_center_support)
+            {
+                ROS_WARN("[LiDAR] Template fallback rejected: center %d has only %d support points (minimum %d).",
+                         i, best.support_by_center[i], min_center_support);
+                return false;
+            }
+        }
+        if (best.support < min_center_support * TARGET_NUM_CIRCLES)
+        {
+            ROS_WARN("[LiDAR] Template fallback rejected: total support=%d, required=%d.",
+                     best.support, min_center_support * TARGET_NUM_CIRCLES);
+            return false;
+        }
+
+        const auto centers = templateCenters(best.x, best.y, best.theta);
+        for (const auto& c : centers)
+        {
+            pcl::PointXYZ p;
+            p.x = static_cast<float>(c.x());
+            p.y = static_cast<float>(c.y());
+            p.z = 0.0f;
+            candidate_centers->push_back(p);
+        }
+
+        ROS_INFO("[LiDAR] Template fallback selected centers: support=%d/%zu, score=%.6f, per-center=[%d,%d,%d,%d].",
+                 best.support, all_points.size(), best.score,
+                 best.support_by_center[0], best.support_by_center[1],
+                 best.support_by_center[2], best.support_by_center[3]);
+        return true;
+    }
+
+    bool fitAnnulusTemplateFromCandidateCenters(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& points,
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& candidate_seed_centers,
+        pcl::PointCloud<pcl::PointXYZ>::Ptr candidate_centers) const
+    {
+        candidate_centers->clear();
+        if (!points || !candidate_seed_centers || candidate_seed_centers->size() < 2)
+        {
+            return false;
+        }
+
+        std::vector<Eigen::Vector2d> all_points;
+        all_points.reserve(points->size());
+        for (const auto& p : *points)
+        {
+            if (std::isfinite(p.x) && std::isfinite(p.y))
+            {
+                all_points.emplace_back(p.x, p.y);
+            }
+        }
+        if (all_points.size() < 80) return false;
+
+        const auto local = templateLocalCenters();
+        TemplateFitResult best;
+        TemplateFitResult current;
+        const double target_diagonal = std::sqrt(delta_width_circles_ * delta_width_circles_ +
+                                                delta_height_circles_ * delta_height_circles_);
+
+        for (size_t a = 0; a < candidate_seed_centers->size(); ++a)
+        {
+            for (size_t b = a + 1; b < candidate_seed_centers->size(); ++b)
+            {
+                const Eigen::Vector2d pa(candidate_seed_centers->points[a].x,
+                                         candidate_seed_centers->points[a].y);
+                const Eigen::Vector2d pb(candidate_seed_centers->points[b].x,
+                                         candidate_seed_centers->points[b].y);
+                const Eigen::Vector2d measured_vec = pb - pa;
+                const double measured_dist = measured_vec.norm();
+                if (!std::isfinite(measured_dist) || measured_dist < 0.2) continue;
+
+                const double nearest_target_error = std::min({
+                    std::fabs(measured_dist - delta_width_circles_),
+                    std::fabs(measured_dist - delta_height_circles_),
+                    std::fabs(measured_dist - target_diagonal)
+                });
+                if (nearest_target_error > 0.16) continue;
+
+                for (int i = 0; i < TARGET_NUM_CIRCLES; ++i)
+                {
+                    for (int j = 0; j < TARGET_NUM_CIRCLES; ++j)
+                    {
+                        if (i == j) continue;
+                        const Eigen::Vector2d local_vec = local[j] - local[i];
+                        const double local_dist = local_vec.norm();
+                        if (std::fabs(local_dist - measured_dist) > 0.18) continue;
+
+                        const double theta = std::atan2(measured_vec.y(), measured_vec.x()) -
+                                             std::atan2(local_vec.y(), local_vec.x());
+                        const double c = std::cos(theta);
+                        const double s = std::sin(theta);
+                        const Eigen::Vector2d rotated_i(c * local[i].x() - s * local[i].y(),
+                                                        s * local[i].x() + c * local[i].y());
+                        const Eigen::Vector2d origin = pa - rotated_i;
+                        annulusTemplateScore(all_points, origin.x(), origin.y(), theta, current);
+                        if (current.score < best.score)
+                        {
+                            best = current;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!std::isfinite(best.score))
+        {
+            ROS_WARN("[LiDAR] Candidate-driven template fallback rejected: support=%d, score=%.6f.",
+                     best.support, best.score);
+            return false;
+        }
+
+        const int min_center_support = 40;
+        for (int i = 0; i < TARGET_NUM_CIRCLES; ++i)
+        {
+            if (best.support_by_center[i] < min_center_support)
+            {
+                ROS_WARN("[LiDAR] Candidate-driven template fallback rejected: center %d has only %d support points (minimum %d).",
+                         i, best.support_by_center[i], min_center_support);
+                return false;
+            }
+        }
+
+        const auto centers = templateCenters(best.x, best.y, best.theta);
+        for (const auto& c : centers)
+        {
+            pcl::PointXYZ p;
+            p.x = static_cast<float>(c.x());
+            p.y = static_cast<float>(c.y());
+            p.z = 0.0f;
+            candidate_centers->push_back(p);
+        }
+        ROS_INFO("[LiDAR] Candidate-driven template selected centers: support=%d/%zu, score=%.6f, per-center=[%d,%d,%d,%d].",
+                 best.support, all_points.size(), best.score,
+                 best.support_by_center[0], best.support_by_center[1],
+                 best.support_by_center[2], best.support_by_center[3]);
+        return true;
+    }
+
     // 从候选中心中选择最符合 0.5m x 0.4m 几何约束的 4 个中心
     bool selectGeometryConsistentCenters(const pcl::PointCloud<pcl::PointXYZ>::Ptr& candidates,
                                          std::vector<int>& selected_indices) const
@@ -1257,7 +1602,8 @@ private:
 
         std::vector<int> selected_indices;
         // 按已知 0.5m x 0.4m annulus 中心几何关系剔除无关高反物。
-        if (!selectGeometryConsistentCentersByDistances(candidate_centers, selected_indices, 0.18))
+        if (!selectGeometryConsistentCentersByDistances(candidate_centers, selected_indices,
+                                                        auto_roi_geometry_max_error_))
         {
             ROS_WARN("[LiDAR] Auto ROI failed: no high-intensity cluster set matches target geometry.");
             return false;
@@ -1620,6 +1966,13 @@ private:
                 cluster->push_back(edge_cloud_->points[idx]);
             }
 
+            if (cluster->size() > 12000)
+            {
+                ROS_WARN("[LiDAR] Skip oversized mechanical cluster %zu with %zu points; template fallback will handle sparse/merged annulus returns.",
+                         i, cluster->size());
+                continue;
+            }
+
             ConcentricCircleFitResult fit;
             const double inner_radius = std::max(0.02, circle_radius_ - annulus_half_width_);
             const double outer_radius = circle_radius_ + annulus_half_width_;
@@ -1859,6 +2212,15 @@ public:
         board_roi_depth_ = params.board_roi_depth;
         auto_roi_voxel_leaf_ = params.auto_roi_voxel_leaf;
         annulus_voxel_leaf_ = params.annulus_voxel_leaf;
+        auto_roi_geometry_max_error_ = params.auto_roi_geometry_max_error;
+        if (!std::isfinite(auto_roi_geometry_max_error_) ||
+            auto_roi_geometry_max_error_ <= 0.0 ||
+            auto_roi_geometry_max_error_ > 0.20)
+        {
+            ROS_WARN("[Config] auto_roi_geometry_max_error %.3f is invalid; using 0.10 m.",
+                     auto_roi_geometry_max_error_);
+            auto_roi_geometry_max_error_ = 0.10;
+        }
         use_auto_lidar_roi_ = params.use_auto_lidar_roi;
 
         filtered_pub_ = nh.advertise<sensor_msgs::PointCloud2>("filtered_cloud", 1);
@@ -1952,6 +2314,43 @@ public:
         }
         if (!best_attempt)
         {
+            pcl::PointCloud<pcl::PointXYZ>::Ptr template_centers(new pcl::PointCloud<pcl::PointXYZ>);
+            if (fitAnnulusTemplateCentersFromPoints(edge_cloud_, template_centers))
+            {
+                ROS_INFO("[LiDAR] Use whole-board annulus template fallback for mechanical LiDAR.");
+                std::vector<int> template_indices = {0, 1, 2, 3};
+                transformCentersBackToLidar(template_centers, template_indices, alignment, center_cloud);
+                return;
+            }
+
+            pcl::PointCloud<pcl::PointXYZ>::Ptr seed_centers(new pcl::PointCloud<pcl::PointXYZ>);
+            auto append_unique_seed_centers =
+                [&](const pcl::PointCloud<pcl::PointXYZ>::Ptr& centers)
+                {
+                    if (!centers) return;
+                    for (const auto& center : centers->points)
+                    {
+                        bool duplicate = false;
+                        for (const auto& existing : seed_centers->points)
+                        {
+                            if (distance3D(existing, center) < 0.08)
+                            {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+                        if (!duplicate) seed_centers->push_back(center);
+                    }
+                };
+            append_unique_seed_centers(interpolated_attempt.candidate_centers);
+            append_unique_seed_centers(high_side_attempt.candidate_centers);
+
+            if (fitAnnulusTemplateFromCandidateCenters(edge_cloud_, seed_centers, template_centers))
+            {
+                ROS_INFO("[LiDAR] Use candidate-driven whole-board template fallback for mechanical LiDAR.");
+                std::vector<int> template_indices = {0, 1, 2, 3};
+                transformCentersBackToLidar(template_centers, template_indices, alignment, center_cloud);
+            }
             return;
         }
 
@@ -1996,6 +2395,12 @@ public:
         {
             ROS_WARN("[LiDAR] Unable to select 4 geometry-consistent annulus centers from %zu candidates.",
                      candidate_centers->size());
+            if (fitAnnulusTemplateCentersFromPoints(edge_cloud_, candidate_centers))
+            {
+                ROS_INFO("[LiDAR] Use whole-board annulus template fallback for solid LiDAR.");
+                selected_indices = {0, 1, 2, 3};
+                transformCentersBackToLidar(candidate_centers, selected_indices, alignment, center_cloud);
+            }
             return;
         }
 

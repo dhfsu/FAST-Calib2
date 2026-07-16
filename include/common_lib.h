@@ -24,8 +24,16 @@ which is included as part of this source code package.
 #include <pcl/sample_consensus/model_types.h>
 #include <pcl/segmentation/extract_clusters.h>
 #include <pcl/registration/transformation_estimation_svd.h>
+#include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <opencv2/opencv.hpp>
+#include <sstream>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <tf/tf.h>
 #include "color.h"
 
@@ -37,7 +45,7 @@ using namespace pcl;
 #define DEBUG 1
 #define GEOMETRY_TOLERANCE 0.08
 
-// ===== 自定义点类型：XYZ + intensity + ring =====
+// ===== 自定义点类型：XYZ + intensity + ring + scan id =====
 namespace Common 
 {
   struct Point
@@ -45,6 +53,7 @@ namespace Common
     PCL_ADD_POINT4D;
     float intensity = 0.0f;      // LiDAR intensity / reflectivity
     std::uint16_t ring = 0;      // 线号（机械雷达/多线雷达）
+    std::uint32_t scan_id = 0;   // 原始 ROS 消息编号，防止不同扫描帧的 ring 点混排
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   } EIGEN_ALIGN16;
 }
@@ -54,27 +63,33 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(Common::Point,
   (float, z, z)
   (float, intensity, intensity)
   (std::uint16_t, ring, ring)
+  (std::uint32_t, scan_id, scan_id)
 );
 
 // 参数结构体
 struct Params {
   double x_min, x_max, y_min, y_max, z_min, z_max;
   bool use_auto_lidar_roi;
+  int camera_width, camera_height;
   double fx, fy, cx, cy, k1, k2, p1, p2;
   double marker_size, delta_width_qr_center, delta_height_qr_center;
   double delta_width_circles, delta_height_circles, circle_radius, annulus_half_width;
   double board_width, board_height, board_roi_margin, board_roi_depth;
-  double auto_roi_voxel_leaf, annulus_voxel_leaf;
+  double auto_roi_voxel_leaf, annulus_voxel_leaf, auto_roi_geometry_max_error;
   int min_detected_markers;
   string image_path;
   string bag_path;
   string lidar_topic;
+  string lidar_forward_axis;
+  string lidar_up_axis;
   string output_path;
 };
 
 // 读取参数
 Params loadParameters(ros::NodeHandle &nh) {
   Params params;
+  nh.param("camera_width", params.camera_width, 0);
+  nh.param("camera_height", params.camera_height, 0);
   nh.param("fx", params.fx, 1215.31801774424);
   nh.param("fy", params.fy, 1214.72961288138);
   nh.param("cx", params.cx, 1047.86571859677);
@@ -97,10 +112,50 @@ Params loadParameters(ros::NodeHandle &nh) {
   nh.param("board_roi_depth", params.board_roi_depth, 0.12);
   nh.param("auto_roi_voxel_leaf", params.auto_roi_voxel_leaf, 0.01);
   nh.param("annulus_voxel_leaf", params.annulus_voxel_leaf, 0.005);
-  nh.param("image_path", params.image_path, string("/home/chunran/calib_ws/src/fast_calib/data/image.png"));
-  nh.param("bag_path", params.bag_path, string("/home/chunran/calib_ws/src/fast_calib/data/input.bag"));
+  nh.param("auto_roi_geometry_max_error", params.auto_roi_geometry_max_error, 0.10);
+  nh.param("image_path", params.image_path, string(""));
+  nh.param("bag_path", params.bag_path, string(""));
   nh.param("lidar_topic", params.lidar_topic, string("/livox/lidar"));
-  nh.param("output_path", params.output_path, string("/home/chunran/calib_ws/src/fast_calib/output"));
+
+  // Prefer an explicit mounting-axis description.  The values answer
+  // "which signed LiDAR axis points forward/up?"; left is derived from the
+  // right-handed relation forward x left = up.
+  bool has_forward_axis = nh.getParam("lidar_forward_axis", params.lidar_forward_axis);
+  bool has_up_axis = nh.getParam("lidar_up_axis", params.lidar_up_axis);
+
+  // Backward compatibility for configurations created before the mounting
+  // axes were user-configurable.  New configurations should not use this.
+  string legacy_sort_mode;
+  bool has_legacy_sort_mode = nh.getParam("lidar_sort_mode", legacy_sort_mode);
+  if (!has_forward_axis && !has_up_axis) {
+    if (has_legacy_sort_mode && legacy_sort_mode == "avia_roll_x_90") {
+      params.lidar_forward_axis = "+x";
+      params.lidar_up_axis = "-y";
+      ROS_WARN("[Config] 'lidar_sort_mode=avia_roll_x_90' is deprecated; use "
+               "'lidar_forward_axis=+x' and 'lidar_up_axis=-y'.");
+    } else {
+      params.lidar_forward_axis = "+x";
+      params.lidar_up_axis = "+z";
+      if (has_legacy_sort_mode && legacy_sort_mode != "standard") {
+        ROS_WARN_STREAM("[Config] Unknown deprecated lidar_sort_mode '"
+                        << legacy_sort_mode << "'; using the standard +X-forward/+Z-up mapping.");
+      } else if (has_legacy_sort_mode) {
+        ROS_WARN("[Config] 'lidar_sort_mode=standard' is deprecated; use "
+                 "'lidar_forward_axis=+x' and 'lidar_up_axis=+z'.");
+      }
+    }
+  } else if (has_forward_axis != has_up_axis) {
+    // Leave the missing value empty.  sortPatternCenters() will reject the
+    // incomplete pair instead of silently choosing an unintended mounting.
+    if (!has_forward_axis) params.lidar_forward_axis.clear();
+    if (!has_up_axis) params.lidar_up_axis.clear();
+    ROS_ERROR("[Config] lidar_forward_axis and lidar_up_axis must be set together.");
+  } else if (has_legacy_sort_mode) {
+    ROS_WARN("[Config] Ignoring deprecated lidar_sort_mode because explicit "
+             "lidar_forward_axis/lidar_up_axis are configured.");
+  }
+
+  nh.param("output_path", params.output_path, string("/tmp/fast_calib_output"));
   nh.param("use_auto_lidar_roi", params.use_auto_lidar_roi, false);
   nh.param("x_min", params.x_min, 1.5);
   nh.param("x_max", params.x_max, 3.0);
@@ -109,6 +164,88 @@ Params loadParameters(ros::NodeHandle &nh) {
   nh.param("z_min", params.z_min, -0.5);
   nh.param("z_max", params.z_max, 2.0);
   return params;
+}
+
+// Verify that the active intrinsics were calibrated for the image resolution
+// being processed.  A wrong scale can still yield a deceptively small four-point
+// registration RMSE while shifting the estimated translation by metres.
+bool validateCameraCalibrationForImage(const Params& params,
+                                       int image_width,
+                                       int image_height,
+                                       std::string& error)
+{
+  if (image_width <= 0 || image_height <= 0) {
+    error = "input image has an invalid resolution";
+    return false;
+  }
+  if (params.camera_width <= 0 || params.camera_height <= 0) {
+    error = "camera_width and camera_height must describe the resolution used to calibrate fx/fy/cx/cy";
+    return false;
+  }
+  if (params.camera_width != image_width || params.camera_height != image_height) {
+    std::ostringstream oss;
+    oss << "camera intrinsics are calibrated for "
+        << params.camera_width << "x" << params.camera_height
+        << ", but the input image is " << image_width << "x" << image_height
+        << "; select a matching config or recalibrate the camera";
+    error = oss.str();
+    return false;
+  }
+  if (!std::isfinite(params.fx) || !std::isfinite(params.fy) ||
+      !std::isfinite(params.cx) || !std::isfinite(params.cy) ||
+      params.fx <= 0.0 || params.fy <= 0.0) {
+    error = "camera focal length and principal point must be finite, with fx/fy > 0";
+    return false;
+  }
+  if (params.cx < 0.0 || params.cx >= static_cast<double>(image_width) ||
+      params.cy < 0.0 || params.cy >= static_cast<double>(image_height)) {
+    error = "camera principal point lies outside the configured image resolution";
+    return false;
+  }
+  if (!std::isfinite(params.k1) || !std::isfinite(params.k2) ||
+      !std::isfinite(params.p1) || !std::isfinite(params.p2)) {
+    error = "camera distortion coefficients must be finite";
+    return false;
+  }
+  return true;
+}
+
+// Create an output directory and any missing parents without invoking a shell.
+bool ensureDirectoryTree(const std::string& path, std::string& error)
+{
+  if (path.empty()) {
+    error = "output_path must not be empty";
+    return false;
+  }
+  if (path.find("$(") != std::string::npos) {
+    error = "output_path contains an unexpanded ROS substitution: " + path;
+    return false;
+  }
+
+  std::string current;
+  current.reserve(path.size());
+  for (std::size_t i = 0; i < path.size(); ++i) {
+    current.push_back(path[i]);
+    const bool at_separator = path[i] == '/';
+    const bool at_end = i + 1 == path.size();
+    if (!at_separator && !at_end) continue;
+
+    std::string candidate = current;
+    while (candidate.size() > 1 && candidate.back() == '/') candidate.pop_back();
+    if (candidate.empty() || candidate == "/") continue;
+
+    if (::mkdir(candidate.c_str(), 0755) != 0 && errno != EEXIST) {
+      error = "cannot create output directory '" + candidate + "': " + std::strerror(errno);
+      return false;
+    }
+
+    struct stat status;
+    if (::stat(candidate.c_str(), &status) != 0 || !S_ISDIR(status.st_mode)) {
+      error = "output path component is not a directory: " + candidate;
+      return false;
+    }
+  }
+  return true;
 }
 
 // 计算两组等长点云之间的三维 RMSE
@@ -250,6 +387,11 @@ void saveTargetHoleCenters(const pcl::PointCloud<pcl::PointXYZ>::Ptr& lidar_cent
       return;
     }
     
+    std::string directory_error;
+    if (!ensureDirectoryTree(params.output_path, directory_error)) {
+        std::cerr << "[saveTargetHoleCenters] " << directory_error << std::endl;
+        return;
+    }
     std::string saveDir = params.output_path;
     if (saveDir.back() != '/') saveDir += '/';
     std::ofstream saveFile(saveDir + "circle_center_record.txt", std::ios::app);
@@ -285,6 +427,12 @@ void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transfo
   if(colored_cloud->empty()) 
   {
     std::cerr << BOLDRED << "[saveCalibrationResults] Colored point cloud is empty!" << RESET << std::endl;
+    return;
+  }
+  std::string directory_error;
+  if (!ensureDirectoryTree(params.output_path, directory_error))
+  {
+    std::cerr << BOLDRED << "[saveCalibrationResults] " << directory_error << RESET << std::endl;
     return;
   }
   std::string outputDir = params.output_path;
@@ -335,29 +483,156 @@ void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transfo
   imwrite(outputDir + "qr_detect.png", img_input);
 }
 
-// 将 4 个标定板中心按固定顺序排序，支持 camera 和 lidar 坐标输入
-void sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc,
+// Parse a signed principal-axis token such as "+x", "-Y", or "z".
+bool parseSignedAxis(const std::string& value,
+                     Eigen::Vector3f& axis,
+                     std::string& normalized)
+{
+  std::string token;
+  token.reserve(value.size());
+  for (char c : value) {
+    if (!std::isspace(static_cast<unsigned char>(c))) {
+      token.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+  }
+
+  if (token.size() == 1 && (token[0] == 'x' || token[0] == 'y' || token[0] == 'z')) {
+    token.insert(token.begin(), '+');
+  }
+  if (token.size() != 2 || (token[0] != '+' && token[0] != '-') ||
+      (token[1] != 'x' && token[1] != 'y' && token[1] != 'z')) {
+    return false;
+  }
+
+  axis = Eigen::Vector3f::Zero();
+  const int index = token[1] == 'x' ? 0 : (token[1] == 'y' ? 1 : 2);
+  axis[index] = token[0] == '+' ? 1.0f : -1.0f;
+  normalized = token;
+  return true;
+}
+
+// Resolve the LiDAR axes that point along the canonical body directions.
+// All vectors are expressed in the native LiDAR frame.  ROS body convention:
+// X forward, Y left, Z up, hence left = up x forward.
+bool resolveLidarMountAxes(const std::string& forward_axis_name,
+                           const std::string& up_axis_name,
+                           Eigen::Vector3f& forward_axis,
+                           Eigen::Vector3f& left_axis,
+                           Eigen::Vector3f& up_axis,
+                           std::string& normalized_forward,
+                           std::string& normalized_left,
+                           std::string& normalized_up,
+                           std::string& error)
+{
+  if (!parseSignedAxis(forward_axis_name, forward_axis, normalized_forward)) {
+    error = "invalid lidar_forward_axis '" + forward_axis_name +
+            "' (expected one of +x, -x, +y, -y, +z, -z)";
+    return false;
+  }
+  if (!parseSignedAxis(up_axis_name, up_axis, normalized_up)) {
+    error = "invalid lidar_up_axis '" + up_axis_name +
+            "' (expected one of +x, -x, +y, -y, +z, -z)";
+    return false;
+  }
+  if (std::fabs(forward_axis.dot(up_axis)) > 1e-6f) {
+    error = "lidar_forward_axis and lidar_up_axis must be perpendicular";
+    return false;
+  }
+
+  left_axis = up_axis.cross(forward_axis);
+  if (left_axis.norm() < 0.5f) {
+    error = "failed to derive lidar left axis";
+    return false;
+  }
+  left_axis.normalize();
+
+  if (std::fabs(left_axis.x()) > 0.5f) {
+    normalized_left = left_axis.x() > 0.0f ? "+x" : "-x";
+  } else if (std::fabs(left_axis.y()) > 0.5f) {
+    normalized_left = left_axis.y() > 0.0f ? "+y" : "-y";
+  } else {
+    normalized_left = left_axis.z() > 0.0f ? "+z" : "-z";
+  }
+
+  // Defensive right-handedness check: forward x left must equal up.
+  if ((forward_axis.cross(left_axis) - up_axis).norm() > 1e-6f) {
+    error = "resolved mounting axes are not right-handed";
+    return false;
+  }
+  return true;
+}
+
+bool validateLidarMountAxes(const std::string& forward_axis_name,
+                            const std::string& up_axis_name,
+                            std::string& error)
+{
+  Eigen::Vector3f forward_axis;
+  Eigen::Vector3f left_axis;
+  Eigen::Vector3f up_axis;
+  std::string normalized_forward;
+  std::string normalized_left;
+  std::string normalized_up;
+  return resolveLidarMountAxes(forward_axis_name, up_axis_name,
+                               forward_axis, left_axis, up_axis,
+                               normalized_forward, normalized_left, normalized_up,
+                               error);
+}
+
+// 将 4 个标定板中心按固定顺序排序，支持 camera 和 lidar 坐标输入。
+// LiDAR 输入先依据用户配置转换为规范机体系，再映射为相机光学坐标
+// (X right, Y down, Z forward)进行排序。
+bool sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc,
                         pcl::PointCloud<pcl::PointXYZ>::Ptr v,
-                        const std::string& axis_mode = "camera") 
+                        const std::string& axis_mode = "camera",
+                        const std::string& lidar_forward_axis = "+x",
+                        const std::string& lidar_up_axis = "+z")
 {
   if (pc->size() != 4) {
     std::cerr << BOLDRED << "[sortPatternCenters] Number of " << axis_mode << " center points to be sorted is not 4." << RESET << std::endl;
-    return;
+    return false;
   }
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr work_pc(new pcl::PointCloud<pcl::PointXYZ>());
 
-  // Coordinate transformation (LiDAR -> Camera)
   if (axis_mode == "lidar") {
+    Eigen::Vector3f forward_axis;
+    Eigen::Vector3f left_axis;
+    Eigen::Vector3f up_axis;
+    std::string normalized_forward;
+    std::string normalized_left;
+    std::string normalized_up;
+    std::string error;
+    if (!resolveLidarMountAxes(lidar_forward_axis, lidar_up_axis,
+                               forward_axis, left_axis, up_axis,
+                               normalized_forward, normalized_left, normalized_up,
+                               error)) {
+      ROS_ERROR_STREAM("[sortPatternCenters] Invalid LiDAR mounting: " << error);
+      v->clear();
+      return false;
+    }
+
+    ROS_INFO_STREAM("[sortPatternCenters] LiDAR mounting resolved: forward="
+                    << normalized_forward << ", left=" << normalized_left
+                    << ", up=" << normalized_up);
+
     for (const auto& p : *pc) {
+      const Eigen::Vector3f lidar_point(p.x, p.y, p.z);
+      const float body_forward = lidar_point.dot(forward_axis);
+      const float body_left = lidar_point.dot(left_axis);
+      const float body_up = lidar_point.dot(up_axis);
+
       pcl::PointXYZ pt;
-      pt.x = -p.y;   // LiDAR Y -> Cam -X
-      pt.y = -p.z;   // LiDAR Z -> Cam -Y
-      pt.z = p.x;    // LiDAR X -> Cam Z
+      pt.x = -body_left;  // body left -> optical right
+      pt.y = -body_up;    // body up   -> optical down
+      pt.z = body_forward;
       work_pc->push_back(pt);
     }
-  } else {
+  } else if (axis_mode == "camera") {
     *work_pc = *pc;
+  } else {
+    ROS_ERROR_STREAM("[sortPatternCenters] Unknown axis_mode '" << axis_mode << "'.");
+    v->clear();
+    return false;
   }
 
   // --- Sorting based on the local coordinate system of the pattern ---
@@ -377,33 +652,29 @@ void sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc,
   // 3. Sort points based on the calculated angle
   std::sort(proj_points.begin(), proj_points.end());
 
-  // 4. Output the sorted points into the result vector 'v'
-  v->resize(4);
+  // 4. Keep the point indices so orientation checks use the transformed
+  // sorting frame while the returned coordinates stay in their native frame.
+  std::vector<int> sorted_indices(4);
   for (int i = 0; i < 4; ++i) {
-    (*v)[i] = work_pc->points[proj_points[i].second];
+    sorted_indices[i] = proj_points[i].second;
   }
 
   // 5. Verify the order (ensure it's counter-clockwise) and fix if necessary
-  const auto& p0 = v->points[0];
-  const auto& p1 = v->points[1];
-  const auto& p2 = v->points[2];
+  const auto& p0 = work_pc->points[sorted_indices[0]];
+  const auto& p1 = work_pc->points[sorted_indices[1]];
+  const auto& p2 = work_pc->points[sorted_indices[2]];
   Eigen::Vector3f v01(p1.x - p0.x, p1.y - p0.y, 0);
   Eigen::Vector3f v12(p2.x - p1.x, p2.y - p1.y, 0);
   if (v01.cross(v12).z() > 0) {
-    std::swap((*v)[1], (*v)[3]);
+    std::swap(sorted_indices[1], sorted_indices[3]);
   }
 
-  // 6. If the original input was in the lidar frame, transform the sorted points back
-  if (axis_mode == "lidar") {
-    for (auto& point : v->points) {
-      float x_new = point.z;    // Cam Z -> LiDAR X
-      float y_new = -point.x;   // Cam -X -> LiDAR Y
-      float z_new = -point.y;   // Cam -Y -> LiDAR Z
-      point.x = x_new;
-      point.y = y_new;
-      point.z = z_new;
-    }
+  // 6. Return the original camera/LiDAR coordinates in the resolved order.
+  v->resize(4);
+  for (int i = 0; i < 4; ++i) {
+    (*v)[i] = pc->points[sorted_indices[i]];
   }
+  return true;
 }
 
 // 计算两个三维点之间的欧氏距离
