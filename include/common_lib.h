@@ -31,6 +31,7 @@ which is included as part of this source code package.
 #include <cmath>
 #include <cstring>
 #include <opencv2/opencv.hpp>
+#include <opencv2/aruco.hpp>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -42,6 +43,8 @@ using namespace cv;
 using namespace pcl;
 
 #define TARGET_NUM_CIRCLES 4
+// 标定板上 marker 的数量；与 TARGET_NUM_CIRCLES 恰好同为 4，但语义不同。
+#define TARGET_NUM_MARKERS 4
 #define DEBUG 1
 #define GEOMETRY_TOLERANCE 0.08
 
@@ -72,6 +75,9 @@ struct Params {
   bool use_auto_lidar_roi;
   int camera_width, camera_height;
   double fx, fy, cx, cy, k1, k2, p1, p2;
+  double k3, k4;                 // 鱼眼（Kannala-Brandt）第 3、4 项；针孔不使用
+  std::string camera_model;      // "pinhole"（默认）或 "fisheye"
+  double fisheye_max_theta_deg;  // 鱼眼角点可用范围（离轴角上限，度）
   double marker_size, delta_width_qr_center, delta_height_qr_center;
   double delta_width_circles, delta_height_circles, circle_radius, annulus_half_width;
   double board_width, board_height, board_roi_margin, board_roi_depth;
@@ -85,9 +91,86 @@ struct Params {
   string output_path;
 };
 
+// 相机模型。空字符串沿用加入 camera_model 之前的隐式默认值（针孔），
+// 这样 Params{} 聚合初始化的语义保持不变。
+enum class CameraModel { Pinhole, Fisheye, Unknown };
+
+// 归一化模型名：忽略大小写、空白，以及 '_' / '-' 分隔符。
+std::string normalizeCameraModel(const std::string& raw)
+{
+  std::string token;
+  token.reserve(raw.size());
+  for (char c : raw) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    if (std::isspace(uc) || c == '_' || c == '-') continue;
+    token.push_back(static_cast<char>(std::tolower(uc)));
+  }
+  return token;
+}
+
+// 接受 pinhole；fisheye / equidistant / equidistantcamera / kb4 / kannalabrandt /
+// opencvfisheye。其余（omni、ocam、atan、polynomial 等）返回 Unknown，
+// 由 validateCameraCalibrationForImage 报错，避免默默按针孔处理鱼眼数据。
+CameraModel parseCameraModel(const std::string& raw)
+{
+  const std::string token = normalizeCameraModel(raw);
+  if (token.empty() || token == "pinhole") return CameraModel::Pinhole;
+  if (token == "fisheye" || token == "equidistant" || token == "equidistantcamera" ||
+      token == "kb4" || token == "kannalabrandt" || token == "opencvfisheye")
+  {
+    return CameraModel::Fisheye;
+  }
+  return CameraModel::Unknown;
+}
+
+bool isFisheyeCameraModel(const Params& params)
+{
+  return parseCameraModel(params.camera_model) == CameraModel::Fisheye;
+}
+
+// Kannala-Brandt 半径模型 r(theta) = theta * (1 + k1*t^2 + k2*t^4 + k3*t^6 + k4*t^8)。
+// cv::fisheye 的去畸变要反解这个多项式，因此 dr/dtheta 必须在用到的角度区间内恒正；
+// 否则反解会落到无效分支上，给出看似正常、实际错误的像素坐标。
+bool fisheyeRadiusModelIsMonotonic(double k1, double k2, double k3, double k4,
+                                   double max_theta_deg)
+{
+  const double max_theta = std::max(1e-6, max_theta_deg) * CV_PI / 180.0;
+  const int samples = 2048;
+  for (int i = 1; i <= samples; ++i)
+  {
+    const double theta = max_theta * i / samples;
+    const double theta2 = theta * theta;
+    const double theta4 = theta2 * theta2;
+    const double theta6 = theta4 * theta2;
+    const double theta8 = theta4 * theta4;
+    const double dr = 1.0 + 3.0 * k1 * theta2 + 5.0 * k2 * theta4 +
+                      7.0 * k3 * theta6 + 9.0 * k4 * theta8;
+    // 写成 !(dr > 0) 以便同时挡住 NaN
+    if (!(dr > 0.0)) return false;
+  }
+  return true;
+}
+
+// 正向 KB 模型在 theta_max 处的归一化半径。像素的归一化半径超过它，
+// 说明该像素落在模型单调区间之外（广角镜头四角往往已经是黑边）。
+double fisheyeRadiusLimit(double k1, double k2, double k3, double k4, double max_theta_deg)
+{
+  const double theta = std::max(1e-6, max_theta_deg) * CV_PI / 180.0;
+  const double theta2 = theta * theta;
+  const double theta4 = theta2 * theta2;
+  const double theta6 = theta4 * theta2;
+  const double theta8 = theta4 * theta4;
+  return theta * (1.0 + k1 * theta2 + k2 * theta4 + k3 * theta6 + k4 * theta8);
+}
+
 // 读取参数
 Params loadParameters(ros::NodeHandle &nh) {
   Params params;
+  nh.param("camera_model", params.camera_model, string("pinhole"));
+  params.camera_model = normalizeCameraModel(params.camera_model);
+  const double default_fisheye_max_theta_deg = 89.0;
+  nh.param("fisheye_max_theta_deg", params.fisheye_max_theta_deg,
+           default_fisheye_max_theta_deg);
   nh.param("camera_width", params.camera_width, 0);
   nh.param("camera_height", params.camera_height, 0);
   nh.param("fx", params.fx, 1215.31801774424);
@@ -98,6 +181,26 @@ Params loadParameters(ros::NodeHandle &nh) {
   nh.param("k2", params.k2, 0.10996870793601);
   nh.param("p1", params.p1, 0.000157303079833973);
   nh.param("p2", params.p2, 0.000544930726278493);
+  params.k3 = 0.0;
+  params.k4 = 0.0;
+  const bool has_k3 = nh.getParam("k3", params.k3);
+  const bool has_k4 = nh.getParam("k4", params.k4);
+  if (isFisheyeCameraModel(params)) {
+    if (has_k3 != has_k4) {
+      ROS_WARN("[Config] only one of k3/k4 is set; the missing one stays 0.0.");
+    }
+    if (!has_k3 && !has_k4 && (nh.hasParam("p1") || nh.hasParam("p2"))) {
+      // 兼容把鱼眼 k3/k4 写在 p1/p2 键里的既有配置（p1/p2 是针孔的切向畸变，
+      // 在鱼眼模型下没有意义）。
+      params.k3 = params.p1;
+      params.k4 = params.p2;
+      ROS_WARN("[Config] camera_model is fisheye but k3/k4 are not set; reusing "
+               "p1=%.9f and p2=%.9f as k3/k4. Rename these keys to k3/k4.",
+               params.k3, params.k4);
+    }
+  } else if (has_k3 || has_k4) {
+    ROS_WARN("[Config] k3/k4 are only used when camera_model is fisheye; ignoring them.");
+  }
   nh.param("marker_size", params.marker_size, 0.2);
   nh.param("delta_width_qr_center", params.delta_width_qr_center, 0.55);
   nh.param("delta_height_qr_center", params.delta_height_qr_center, 0.35);
@@ -174,6 +277,12 @@ bool validateCameraCalibrationForImage(const Params& params,
                                        int image_height,
                                        std::string& error)
 {
+  const CameraModel camera_model = parseCameraModel(params.camera_model);
+  if (camera_model == CameraModel::Unknown) {
+    error = "camera_model must be 'pinhole' or 'fisheye' (got '" +
+            params.camera_model + "')";
+    return false;
+  }
   if (image_width <= 0 || image_height <= 0) {
     error = "input image has an invalid resolution";
     return false;
@@ -202,13 +311,193 @@ bool validateCameraCalibrationForImage(const Params& params,
     error = "camera principal point lies outside the configured image resolution";
     return false;
   }
-  if (!std::isfinite(params.k1) || !std::isfinite(params.k2) ||
-      !std::isfinite(params.p1) || !std::isfinite(params.p2)) {
+  if (camera_model == CameraModel::Fisheye) {
+    if (!std::isfinite(params.k1) || !std::isfinite(params.k2) ||
+        !std::isfinite(params.k3) || !std::isfinite(params.k4)) {
+      error = "fisheye distortion coefficients k1..k4 must be finite";
+      return false;
+    }
+    if (!fisheyeRadiusModelIsMonotonic(params.k1, params.k2, params.k3, params.k4,
+                                       params.fisheye_max_theta_deg)) {
+      error = "fisheye distortion k1..k4 make the Kannala-Brandt radius "
+              "non-monotonic up to fisheye_max_theta_deg; the fisheye model "
+              "cannot be inverted";
+      return false;
+    }
+  } else if (!std::isfinite(params.k1) || !std::isfinite(params.k2) ||
+             !std::isfinite(params.p1) || !std::isfinite(params.p2)) {
     error = "camera distortion coefficients must be finite";
     return false;
   }
   return true;
 }
+
+// 构造标定板几何（板坐标系，Z=0 平面）：4 个 marker 的角点、4 个圆心、以及
+// 与 boardCorners 下标一一对应的 marker ID。
+// marker 顺序与 ID 的对应关系（沿用原实现）：
+//   Marker 0 -> aRuCo ID 1, Marker 1 -> ID 2, Marker 2 -> ID 4, Marker 3 -> ID 3
+void buildTargetBoardGeometry(double marker_size,
+                              double delta_width_qr_center, double delta_height_qr_center,
+                              double delta_width_circles, double delta_height_circles,
+                              std::vector<std::vector<cv::Point3f>>& boardCorners,
+                              std::vector<cv::Point3f>& boardCircleCenters,
+                              std::vector<int>& boardIds)
+{
+  const float width = delta_width_qr_center;
+  const float height = delta_height_qr_center;
+  const float circle_width = delta_width_circles / 2.;
+  const float circle_height = delta_height_circles / 2.;
+
+  boardCorners.assign(TARGET_NUM_MARKERS, std::vector<cv::Point3f>());
+  boardCircleCenters.clear();
+  boardCircleCenters.reserve(TARGET_NUM_CIRCLES);
+
+  for (int i = 0; i < TARGET_NUM_MARKERS; ++i) {
+    // x 方向：0、3 号在左；y 方向：0、1 号在上
+    const int x_qr_center = (i % 3) == 0 ? -1 : 1;
+    const int y_qr_center = (i < 2) ? 1 : -1;
+    const float x_center = x_qr_center * width;
+    const float y_center = y_qr_center * height;
+
+    cv::Point3f circleCenter3d(x_qr_center * circle_width,
+                               y_qr_center * circle_height, 0);
+    boardCircleCenters.push_back(circleCenter3d);
+
+    for (int j = 0; j < 4; ++j) {
+      const int x_qr = (j % 3) == 0 ? -1 : 1;
+      const int y_qr = (j < 2) ? 1 : -1;
+      cv::Point3f pt3d(x_center + x_qr * marker_size / 2.,
+                       y_center + y_qr * marker_size / 2., 0);
+      boardCorners[i].push_back(pt3d);
+    }
+  }
+
+  boardIds = std::vector<int>{1, 2, 4, 3};
+}
+
+// 由 marker 角点估计标定板位姿（板坐标系 -> 相机坐标系）。
+// corners 必须与 ids 同构，且每个 marker 都要有完整的 4 个角点：针孔模型可直接传
+// 原始角点；鱼眼模型需先经 undistortFisheyeObservations 投到与 K 同尺度的虚拟针孔
+// 平面，并传入该 K 与零畸变。
+// 先用各 marker 位姿的平均值作为初值，再用 estimatePoseBoard(useExtrinsicGuess) 精化：
+// 平面靶标的 PnP 存在镜像解，且镜像解的重投影误差与真解相同，只能靠初值避开。
+// marker_rvecs / marker_tvecs 回传各 marker 的单独位姿，供调用方绘制调试坐标轴。
+bool estimateBoardPoseFromMarkers(const cv::Ptr<cv::aruco::Board>& board,
+                                 const std::vector<std::vector<cv::Point2f>>& corners,
+                                 const std::vector<int>& ids,
+                                 double marker_size,
+                                 const cv::Mat& cameraMatrix,
+                                 const cv::Mat& distCoeffs,
+                                 std::vector<cv::Vec3d>& marker_rvecs,
+                                 std::vector<cv::Vec3d>& marker_tvecs,
+                                 cv::Vec3d& rvec, cv::Vec3d& tvec)
+{
+  marker_rvecs.clear();
+  marker_tvecs.clear();
+  if (!board || ids.empty() || corners.size() != ids.size()) return false;
+
+  cv::aruco::estimatePoseSingleMarkers(corners, marker_size, cameraMatrix, distCoeffs,
+                                       marker_rvecs, marker_tvecs);
+  if (marker_rvecs.size() != ids.size() || marker_tvecs.size() != ids.size()) {
+    return false;
+  }
+
+  // 累加各 marker 的位姿作为初值
+  rvec = cv::Vec3d(0, 0, 0);
+  tvec = cv::Vec3d(0, 0, 0);
+  cv::Vec3f rvec_sin(0, 0, 0), rvec_cos(0, 0, 0);
+  for (size_t i = 0; i < marker_rvecs.size(); ++i) {
+    tvec[0] += marker_tvecs[i][0];
+    tvec[1] += marker_tvecs[i][1];
+    tvec[2] += marker_tvecs[i][2];
+    rvec_sin[0] += sin(marker_rvecs[i][0]);
+    rvec_sin[1] += sin(marker_rvecs[i][1]);
+    rvec_sin[2] += sin(marker_rvecs[i][2]);
+    rvec_cos[0] += cos(marker_rvecs[i][0]);
+    rvec_cos[1] += cos(marker_rvecs[i][1]);
+    rvec_cos[2] += cos(marker_rvecs[i][2]);
+  }
+
+  // 平均位姿：旋转用 atan2(sin/cos) 平均
+  tvec = tvec / int(ids.size());
+  rvec_sin = rvec_sin / int(ids.size());
+  rvec_cos = rvec_cos / int(ids.size());
+  rvec[0] = atan2(rvec_sin[0], rvec_cos[0]);
+  rvec[1] = atan2(rvec_sin[1], rvec_cos[1]);
+  rvec[2] = atan2(rvec_sin[2], rvec_cos[2]);
+
+#if (CV_MAJOR_VERSION == 3 && CV_MINOR_VERSION <= 2) || CV_MAJOR_VERSION < 3
+  const int valid = cv::aruco::estimatePoseBoard(corners, ids, board, cameraMatrix,
+                                                 distCoeffs, rvec, tvec);
+#else
+  const int valid = cv::aruco::estimatePoseBoard(corners, ids, board, cameraMatrix,
+                                                 distCoeffs, rvec, tvec, true);
+#endif
+  return valid > 0;
+}
+
+// 把鱼眼原始像素角点投到与 K 同尺度的虚拟针孔平面，并按模型有效域整块剔除 marker。
+// 判据：角点的归一化半径必须 <= fisheyeRadiusLimit(...)。超出该范围的像素落在 KB
+// 反解的单调区间之外（广角镜头的四角通常已经是黑边），cv::fisheye::undistortPoints
+// 会返回看似正常、实际错误的像素，必须整块丢弃而不是勉强使用。
+// 过滤以 marker 为单位：estimatePoseBoard 要求每个 marker 贡献完整 4 个角点，
+// 只丢个别角点无法表达。
+// marker_valid[i] == 1 表示 corners_virt[i] 可用。返回是否至少保留了 1 个 marker。
+bool undistortFisheyeObservations(const std::vector<std::vector<cv::Point2f>>& corners_raw,
+                                  const cv::Mat& cameraMatrix, const cv::Mat& distCoeffs,
+                                  double max_theta_deg,
+                                  std::vector<std::vector<cv::Point2f>>& corners_virt,
+                                  std::vector<char>& marker_valid)
+{
+  corners_virt.assign(corners_raw.size(), std::vector<cv::Point2f>());
+  marker_valid.assign(corners_raw.size(), 0);
+
+  cv::Mat K, D;
+  cameraMatrix.convertTo(K, CV_64F);
+  distCoeffs.convertTo(D, CV_64F);
+  if (K.rows != 3 || K.cols != 3 || D.total() != 4) {
+    ROS_ERROR("[Fisheye] camera matrix must be 3x3 and distortion must have exactly "
+              "4 coefficients [k1 k2 k3 k4]");
+    return false;
+  }
+
+  const double fx = K.at<double>(0, 0), fy = K.at<double>(1, 1);
+  const double cx = K.at<double>(0, 2), cy = K.at<double>(1, 2);
+  const double radius_limit = fisheyeRadiusLimit(D.at<double>(0), D.at<double>(1),
+                                                 D.at<double>(2), D.at<double>(3),
+                                                 max_theta_deg);
+
+  bool any_kept = false;
+  for (size_t m = 0; m < corners_raw.size(); ++m) {
+    bool keep = corners_raw[m].size() == 4;
+    for (size_t c = 0; keep && c < corners_raw[m].size(); ++c) {
+      const double xd = (static_cast<double>(corners_raw[m][c].x) - cx) / fx;
+      const double yd = (static_cast<double>(corners_raw[m][c].y) - cy) / fy;
+      if (!std::isfinite(xd) || !std::isfinite(yd) ||
+          std::hypot(xd, yd) > radius_limit) {
+        keep = false;
+      }
+    }
+    if (!keep) continue;
+
+    cv::fisheye::undistortPoints(corners_raw[m], corners_virt[m], K, D,
+                                 cv::Matx33d::eye(), K);
+    for (const auto& pt : corners_virt[m]) {
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y)) {
+        keep = false;
+        break;
+      }
+    }
+    if (!keep) {
+      corners_virt[m].clear();
+      continue;
+    }
+    marker_valid[m] = 1;
+    any_kept = true;
+  }
+  return any_kept;
+}
+
 
 // Create an output directory and any missing parents without invoking a shell.
 bool ensureDirectoryTree(const std::string& path, std::string& error)
@@ -377,6 +666,96 @@ void projectPointCloudToImage(const pcl::PointCloud<Common::Point>::Ptr& cloud,
   }
 }
 
+// 鱼眼（Kannala-Brandt，cv::fisheye）版本：把 LiDAR 点直接投影到**原始**鱼眼图像上。
+// 与 projectPointCloudToImage 的区别：
+//   * 不对整幅图像做去畸变，而是用 cv::fisheye::projectPoints 正向投影每个点；
+//   * distCoeffs 必须是 4x1 的 [k1 k2 k3 k4]；
+//   * z <= 0 的点必须丢弃：鱼眼模型会把它们投到图像的镜像位置。
+void projectPointCloudToImageFisheye(const pcl::PointCloud<Common::Point>::Ptr& cloud,
+  const Eigen::Matrix4f& transformation,
+  const cv::Mat& cameraMatrix,
+  const cv::Mat& distCoeffs,
+  const cv::Mat& image,
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr& colored_cloud)
+{
+  colored_cloud->clear();
+  colored_cloud->reserve(cloud->size());
+
+  cv::Mat K, D;
+  cameraMatrix.convertTo(K, CV_64F);
+  distCoeffs.convertTo(D, CV_64F);
+  if (D.total() != 4) {
+    ROS_ERROR("[Fisheye] distortion must have exactly 4 coefficients [k1 k2 k3 k4]");
+    return;
+  }
+
+  // 点已经变换到相机系，rvec/tvec 置零
+  const cv::Mat rvec = cv::Mat::zeros(3, 1, CV_64F);
+  const cv::Mat tvec = cv::Mat::zeros(3, 1, CV_64F);
+
+  const int image_width = image.cols;
+  const int image_height = image.rows;
+  const size_t batch_size = 4096;
+
+  std::vector<cv::Point3f> batch_points;
+  std::vector<Eigen::Vector3f> batch_camera_points;
+  batch_points.reserve(batch_size);
+  batch_camera_points.reserve(batch_size);
+
+  auto flush_batch = [&]() {
+    if (batch_points.empty()) return;
+
+    std::vector<cv::Point2f> image_points;
+    image_points.resize(batch_points.size());
+    cv::fisheye::projectPoints(batch_points, image_points, rvec, tvec, K, D);
+
+    for (size_t i = 0; i < image_points.size(); ++i) {
+      const int u = static_cast<int>(std::lround(image_points[i].x));
+      const int v = static_cast<int>(std::lround(image_points[i].y));
+
+      if (u >= 0 && u < image_width && v >= 0 && v < image_height) {
+        const cv::Vec3b color = image.at<cv::Vec3b>(v, u);
+
+        pcl::PointXYZRGB colored_point;
+        colored_point.x = batch_camera_points[i].x();
+        colored_point.y = batch_camera_points[i].y();
+        colored_point.z = batch_camera_points[i].z();
+        colored_point.r = color[2];
+        colored_point.g = color[1];
+        colored_point.b = color[0];
+        colored_cloud->push_back(colored_point);
+      }
+    }
+
+    batch_points.clear();
+    batch_camera_points.clear();
+  };
+
+  for (const auto& point : *cloud) {
+    // 变换到相机系
+    Eigen::Vector4f homogeneous_point(point.x, point.y, point.z, 1.0f);
+    Eigen::Vector4f transformed_point = transformation * homogeneous_point;
+
+    // 只保留相机前方的点：鱼眼模型对 z <= 0 的点会给出镜像位置的像素
+    if (transformed_point(2) <= 0.0f) continue;
+
+    batch_points.emplace_back(transformed_point(0), transformed_point(1),
+                              transformed_point(2));
+    batch_camera_points.emplace_back(transformed_point(0), transformed_point(1),
+                                     transformed_point(2));
+
+    if (batch_points.size() >= batch_size) flush_batch();
+  }
+  flush_batch();
+
+  if (DEBUG) {
+    std::cout << BOLDYELLOW << "[Projection] fisheye: " << BOLDWHITE << cloud->size()
+              << BOLDYELLOW << " points in, " << BOLDWHITE << colored_cloud->size()
+              << BOLDYELLOW << " colored inside the image (" << image_width << "x"
+              << image_height << ")" << RESET << std::endl;
+  }
+}
+
 // 记录一帧 LiDAR 圆心与 QR 圆心配对结果，便于离线检查
 void saveTargetHoleCenters(const pcl::PointCloud<pcl::PointXYZ>::Ptr& lidar_centers,
                       const pcl::PointCloud<pcl::PointXYZ>::Ptr& qr_centers,
@@ -441,8 +820,11 @@ void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transfo
   std::ofstream outFile(outputDir + "single_calib_result.txt");
   if (outFile.is_open()) 
   {
+    // 相机模型：FAST-LIVO2 的 vikit camera_loader 用 "EquidistantCamera" 表示
+    // Kannala-Brandt 鱼眼（读 k1..k4），"Pinhole" 表示针孔（读 cam_d0..cam_d3）。
+    const bool fisheye_camera = isFisheyeCameraModel(params);
     outFile << "# FAST-LIVO2 calibration format\n";
-    outFile << "cam_model: Pinhole\n";
+    outFile << "cam_model: " << (fisheye_camera ? "EquidistantCamera" : "Pinhole") << "\n";
     outFile << "cam_width: " << img_input.cols << "\n";
     outFile << "cam_height: " << img_input.rows << "\n";
     outFile << "scale: 1.0\n";
@@ -450,10 +832,17 @@ void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transfo
     outFile << "cam_fy: " << params.fy << "\n";
     outFile << "cam_cx: " << params.cx << "\n";
     outFile << "cam_cy: " << params.cy << "\n";
-    outFile << "cam_d0: " << params.k1 << "\n";
-    outFile << "cam_d1: " << params.k2 << "\n";
-    outFile << "cam_d2: " << params.p1 << "\n";
-    outFile << "cam_d3: " << params.p2 << "\n";
+    if (fisheye_camera) {
+      outFile << "k1: " << params.k1 << "\n";
+      outFile << "k2: " << params.k2 << "\n";
+      outFile << "k3: " << params.k3 << "\n";
+      outFile << "k4: " << params.k4 << "\n";
+    } else {
+      outFile << "cam_d0: " << params.k1 << "\n";
+      outFile << "cam_d1: " << params.k2 << "\n";
+      outFile << "cam_d2: " << params.p1 << "\n";
+      outFile << "cam_d3: " << params.p2 << "\n";
+    }
 
     outFile << "\nRcl: [" << std::fixed << std::setprecision(6);
     outFile << std::setw(10) << transformation(0, 0) << ", " << std::setw(10) << transformation(0, 1) << ", " << std::setw(10) << transformation(0, 2) << ",\n";

@@ -149,7 +149,17 @@ int main(int argc, char **argv)
     std::cout << BOLDCYAN << std::fixed << std::setprecision(6) << transformation << RESET << std::endl;
 
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-    projectPointCloudToImage(cloud_input, transformation, qrDetectPtr->cameraMatrix_, qrDetectPtr->distCoeffs_, img_input, colored_cloud);
+    if (isFisheyeCameraModel(params))
+    {
+      // 鱼眼：直接投到原始鱼眼图，不做整幅去畸变
+      projectPointCloudToImageFisheye(cloud_input, transformation, qrDetectPtr->cameraMatrix_,
+                                      qrDetectPtr->distCoeffs_, img_input, colored_cloud);
+    }
+    else
+    {
+      projectPointCloudToImage(cloud_input, transformation, qrDetectPtr->cameraMatrix_,
+                               qrDetectPtr->distCoeffs_, img_input, colored_cloud);
+    }
 
     saveCalibrationResults(params, transformation, colored_cloud, qrDetectPtr->imageCopy_);
 

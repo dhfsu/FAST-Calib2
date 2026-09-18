@@ -9,6 +9,7 @@
   <arg name="lidar_up_axis" default="" />
   <arg name="output_path" default="" />
   <arg name="use_auto_lidar_roi" default="" />
+  <arg name="camera_model" default="" />
 
   <rosparam file="$(arg config_file)" command="load" subst_value="true" />
 
@@ -33,6 +34,9 @@
   </group>
   <group if="$(eval arg('use_auto_lidar_roi') != '')">
     <param name="use_auto_lidar_roi" value="$(arg use_auto_lidar_roi)" />
+  </group>
+  <group if="$(eval arg('camera_model') != '')">
+    <param name="camera_model" value="$(arg camera_model)" />
   </group>
 
   <node pkg="fast_calib" type="fast_calib" name="fast_calib"

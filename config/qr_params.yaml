@@ -1,5 +1,12 @@
 # Camera intrinsics
+  # Camera model: pinhole (default) or fisheye.
+  # "fisheye" is the Kannala-Brandt / equidistant model (cv::fisheye, Kalibr
+  # "equidistant", FAST-LIVO2 EquidistantCamera) with 4 coefficients k1..k4.
+  # Accepted aliases: equidistant, EquidistantCamera, kb4, kannala_brandt,
+  # opencv_fisheye (case-insensitive). Any other value is rejected at startup.
+  camera_model: pinhole
   # Resolution used when calibrating the active intrinsics below.
+  # For a fisheye camera this must be the RAW image resolution.
   camera_width: 2448
   camera_height: 2048
   fx: 2364.049767406230
@@ -10,6 +17,32 @@
   k2: 0.125944589327291
   p1: -0.0002140931408129925
   p2: 0.0006409200928440982
+  # Fisheye only: the 3rd and 4th Kannala-Brandt coefficients. Ignored for pinhole.
+  # (Legacy fisheye configs that kept them in p1/p2 still load, with a warning.)
+  # k3: 0.0
+  # k4: 0.0
+  # Fisheye only: off-axis cutoff. Markers whose corners lie outside the model's
+  # monotonic range are dropped; wide-angle lenses are usually black there.
+  # fisheye_max_theta_deg: 89.0
+
+# ===== Fisheye camera example (vanjee, 4000x3000, Kannala-Brandt) =====
+# Fill in the intrinsics from scripts/calibrate_fisheye_intrinsics.py
+# (its equidistant.yaml holds fx, fy, cx, cy and k1..k4), then replace the block
+# above with:
+#   camera_model: fisheye
+#   camera_width: 4000
+#   camera_height: 3000
+#   fx: 792.4057085207388
+#   fy: 792.3582580692001
+#   cx: 2004.5367643055422
+#   cy: 1500.454819537657
+#   k1:  0.09095816477283435
+#   k2: -0.02448764621169176
+#   k3:  0.008319662193425007
+#   k4: -0.0036367895734679048
+#   fisheye_max_theta_deg: 89.0
+# and point lidar_topic/bag_path/image_path at the fisheye rig, e.g.
+#   lidar_topic: "/vanjee_points722"
 
 # Calibration target parameters
   marker_size: 0.20 # ArUco marker side length; adjust to match your physical target

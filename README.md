@@ -99,12 +99,61 @@ Typical multi-scene target placement:
   <font color=#a0a0a0 size=2>Placement of the calibration target for multi-scene data collection: (a) facing forward, (b) oriented to the right, (c) oriented to the left.</font>
 </p>
 
+### Fisheye cameras
+
+Both camera models are supported and selected with `camera_model` in `config/qr_params.yaml`:
+
+| `camera_model` | Model | Coefficients |
+| --- | --- | --- |
+| `pinhole` (default) | pinhole + radial-tangential | `k1, k2, p1, p2` |
+| `fisheye` | Kannala-Brandt / equidistant (`cv::fisheye`) | `k1, k2, k3, k4` |
+
+`fisheye` uses the same convention as OpenCV's `cv::fisheye`, Kalibr's `equidistant` and
+FAST-LIVO2's `EquidistantCamera`. `camera_model` also accepts `equidistant`,
+`EquidistantCamera`, `kb4`, `kannala_brandt` and `opencv_fisheye` (case-insensitive).
+Any other value is rejected at startup rather than being silently treated as a pinhole camera.
+
+For a fisheye camera the image is used **raw**: ArUco corners are detected on the original
+fisheye image, mapped onto a virtual pinhole plane, and only then used for the board pose.
+LiDAR points are likewise projected into the raw fisheye image for the colored cloud.
+Marker corners whose off-axis angle exceeds `fisheye_max_theta_deg` (default `89`) are
+dropped, since the Kannala-Brandt model cannot be inverted reliably outside its monotonic
+range — wide-angle lenses are usually already black there. Detection requires at least
+`min_detected_markers` (default 3) markers to remain after that filtering.
+
+Steps:
+
+1. Calibrate the intrinsics with the bundled script (checkerboard with 6 x 9 inner corners,
+   0.1 m squares by default) and take `fx, fy, cx, cy, k1..k4` from its
+   `calib_output/equidistant.yaml`:
+
+   ```bash
+   python3 scripts/calibrate_fisheye_intrinsics.py \
+       --image_glob "images/*.png" \
+       --checkerboard_cols 6 --checkerboard_rows 9 --square_size 0.10 \
+       --output_dir calib_output
+   ```
+
+2. Put those values into `config/qr_params.yaml` together with `camera_model: fisheye` and
+   `camera_width`/`camera_height` set to the **raw** resolution the intrinsics were
+   calibrated at (the run aborts if they do not match the input image). A worked example
+   for a 4000x3000 fisheye camera is kept as a comment block in that file.
+
+3. Run the calibration as usual. The result file then carries a FAST-LIVO2-ready camera
+   block (`cam_model: EquidistantCamera` with `k1..k4`), while pinhole cameras keep writing
+   `cam_model: Pinhole` with `cam_d0..cam_d3`.
+
+Wide-angle lenses need the target to stay inside the valid image circle; a board placed in
+the black corners of a fisheye frame cannot be calibrated. The `qr_detect.png` written to
+the output folder shows the detected markers, the reprojected annulus centers and the board
+axes, which is the quickest way to confirm that the fisheye intrinsics are correct.
+
 ## 5. Standalone LiDAR Center Extraction Test
 
 <details>
 <summary>Show Unit Test Usage</summary>
 
-The repository also provides a LiDAR-only test tool for checking annulus center extraction before running full camera-LiDAR calibration.
+The repository also provides a LiDAR-only test tool for checking annulus center extraction before running full camera-LiDAR calibration. It does not use the camera at all, so `camera_model` does not affect it.
 
 Load parameters:
 
