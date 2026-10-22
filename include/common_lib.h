@@ -24,12 +24,14 @@ which is included as part of this source code package.
 #include <pcl/sample_consensus/model_types.h>
 #include <pcl/segmentation/extract_clusters.h>
 #include <pcl/registration/transformation_estimation_svd.h>
+#include <Eigen/Dense>
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <opencv2/opencv.hpp>
 #include <opencv2/aruco.hpp>
 #include <sstream>
@@ -76,8 +78,9 @@ struct Params {
   int camera_width, camera_height;
   double fx, fy, cx, cy, k1, k2, p1, p2;
   double k3, k4;                 // 鱼眼（Kannala-Brandt）第 3、4 项；针孔不使用
-  std::string camera_model;      // "pinhole"（默认）或 "fisheye"
-  double fisheye_max_theta_deg;  // 鱼眼角点可用范围（离轴角上限，度）
+  double xi;                     // omni（Mei 统一模型）的 mirror 参数；其它模型不使用
+  std::string camera_model;      // "pinhole"（默认）、"fisheye" 或 "omni"
+  double fisheye_max_theta_deg;  // 鱼眼/omni 角点可用范围（离轴角上限，度）
   double marker_size, delta_width_qr_center, delta_height_qr_center;
   double delta_width_circles, delta_height_circles, circle_radius, annulus_half_width;
   double board_width, board_height, board_roi_margin, board_roi_depth;
@@ -93,7 +96,7 @@ struct Params {
 
 // 相机模型。空字符串沿用加入 camera_model 之前的隐式默认值（针孔），
 // 这样 Params{} 聚合初始化的语义保持不变。
-enum class CameraModel { Pinhole, Fisheye, Unknown };
+enum class CameraModel { Pinhole, Fisheye, Omni, Unknown };
 
 // 归一化模型名：忽略大小写、空白，以及 '_' / '-' 分隔符。
 std::string normalizeCameraModel(const std::string& raw)
@@ -109,8 +112,12 @@ std::string normalizeCameraModel(const std::string& raw)
 }
 
 // 接受 pinhole；fisheye / equidistant / equidistantcamera / kb4 / kannalabrandt /
-// opencvfisheye。其余（omni、ocam、atan、polynomial 等）返回 Unknown，
-// 由 validateCameraCalibrationForImage 报错，避免默默按针孔处理鱼眼数据。
+// opencvfisheye；omni / omnicamera / mei / meicamera / unified / omnidir
+// （Mei 统一模型，即 Kalibr 的 omni-radtan、cv::omnidir、camodocal CataCamera）。
+// 其余（ocam、atan、polynomial 等）返回 Unknown，由 validateCameraCalibrationForImage
+// 报错，避免默默按针孔处理广角数据。
+// 注意 ocam 是 Scaramuzza 多项式模型（FAST-LIVO2 vikit 里的 OmniCamera），与 omni
+// 不是同一个模型，因此不在这里接受。
 CameraModel parseCameraModel(const std::string& raw)
 {
   const std::string token = normalizeCameraModel(raw);
@@ -120,12 +127,29 @@ CameraModel parseCameraModel(const std::string& raw)
   {
     return CameraModel::Fisheye;
   }
+  if (token == "omni" || token == "omnicamera" || token == "mei" ||
+      token == "meicamera" || token == "unified" || token == "omnidir")
+  {
+    return CameraModel::Omni;
+  }
   return CameraModel::Unknown;
 }
 
 bool isFisheyeCameraModel(const Params& params)
 {
   return parseCameraModel(params.camera_model) == CameraModel::Fisheye;
+}
+
+bool isOmniCameraModel(const Params& params)
+{
+  return parseCameraModel(params.camera_model) == CameraModel::Omni;
+}
+
+// 针孔之外的所有模型都用原始图像 + 模型相关投影，不走"整幅去畸变"的针孔路径。
+bool isWideAngleCameraModel(const Params& params)
+{
+  const CameraModel model = parseCameraModel(params.camera_model);
+  return model == CameraModel::Fisheye || model == CameraModel::Omni;
 }
 
 // Kannala-Brandt 半径模型 r(theta) = theta * (1 + k1*t^2 + k2*t^4 + k3*t^6 + k4*t^8)。
@@ -163,14 +187,195 @@ double fisheyeRadiusLimit(double k1, double k2, double k3, double k4, double max
   return theta * (1.0 + k1 * theta2 + k2 * theta4 + k3 * theta6 + k4 * theta8);
 }
 
+// ===== omni（Mei 统一模型 / Kalibr omni-radtan / cv::omnidir / camodocal CataCamera）=====
+// 正向投影：m = (X/(Z + xi*||P||), Y/(Z + xi*||P||))，再对 m 施加 radtan [k1 k2 p1 p2]，
+// 最后 u = fx*xd + cx。xi = 0 时退化为针孔（m = X/Z）。
+//
+// 有效域由两条约束决定，超出后像素到射线不再一一对应，必须整块丢弃：
+//   * 分母 Z + xi*||P|| > 0，即 cos(theta) > -xi：xi < 1 时在 acos(-xi) 处出现极点；
+//   * m(theta) 单调，dm/dtheta ∝ 1 + xi*cos(theta)：xi >= 1 时在 acos(-1/xi) 处回折
+//     （xi = 1 是抛物折反射相机，回折点恰好落在 180 度）。
+// xi <= -1 时分母在光轴上就已经非正，参数本身不可解释。
+double omniThetaLimitDeg(double xi)
+{
+  if (!std::isfinite(xi)) return 0.0;
+  const double c = (xi >= 1.0) ? -1.0 / xi : -xi;
+  if (c < -1.0 || c > 1.0) return 0.0;
+  return std::acos(c) * 180.0 / CV_PI;
+}
+
+// 模型解析上限与配置上限取小，得到实际可用的离轴角上限。
+double omniUsableThetaDeg(double xi, double max_theta_deg)
+{
+  return std::min(std::max(0.0, max_theta_deg), omniThetaLimitDeg(xi));
+}
+
+// 归一化半径 r(theta) = m * (1 + k1*m^2 + k2*m^4)，m = sin(theta)/(cos(theta) + xi)。
+// 反解要解它，因此 r 必须在用到的角度区间内严格递增（同时挡住分母过零和回折）。
+bool omniRadiusModelIsMonotonic(double xi, double k1, double k2, double max_theta_deg)
+{
+  const double max_theta = std::max(1e-6, max_theta_deg) * CV_PI / 180.0;
+  const int samples = 2048;
+  double prev = 0.0;
+  for (int i = 1; i <= samples; ++i)
+  {
+    const double theta = max_theta * i / samples;
+    const double denom = std::cos(theta) + xi;
+    if (!(denom > 0.0)) return false;
+    const double m = std::sin(theta) / denom;
+    const double m2 = m * m;
+    const double r = m * (1.0 + k1 * m2 + k2 * m2 * m2);
+    if (!(r > prev)) return false;
+    prev = r;
+  }
+  return true;
+}
+
+// 正向模型在 theta_max 处的归一化半径。像素的归一化半径超过它，即落在模型有效域之外。
+double omniRadiusLimit(double xi, double k1, double k2, double max_theta_deg)
+{
+  const double theta = std::max(1e-6, max_theta_deg) * CV_PI / 180.0;
+  const double m = std::sin(theta) / (std::cos(theta) + xi);
+  const double m2 = m * m;
+  return m * (1.0 + k1 * m2 + k2 * m2 * m2);
+}
+
+// 相机系 3D 点 -> 像素。cameraMatrix 必须是 CV_64F 的 3x3，
+// distCoeffs 必须是 4x1/1x4 的 radtan [k1 k2 p1 p2]。点在有效域之外时返回 false。
+bool omniProjectPoint(const cv::Point3d& pt_cam, const cv::Mat& cameraMatrix, double xi,
+                      const cv::Mat& distCoeffs, double max_theta_deg, cv::Point2d& pixel)
+{
+  const double X = pt_cam.x, Y = pt_cam.y, Z = pt_cam.z;
+  const double r3 = std::sqrt(X * X + Y * Y + Z * Z);
+  if (!(r3 > 0.0)) return false;
+
+  const double denom = Z + xi * r3;
+  if (!(denom > 1e-9 * r3)) return false;  // 落在分母过零点之外
+
+  // 有效域直接用离轴角判定，不能用半径：越过回折点后半径会重新变小（正后方的点会被
+  // 投到图像中心），半径判据在那里失效。
+  const double theta_deg =
+      std::acos(std::max(-1.0, std::min(1.0, Z / r3))) * 180.0 / CV_PI;
+  if (!(theta_deg <= max_theta_deg + 1e-9)) return false;
+
+  const double mx = X / denom, my = Y / denom;
+  const double m2 = mx * mx + my * my;
+  const double k1 = distCoeffs.at<double>(0), k2 = distCoeffs.at<double>(1);
+  const double p1 = distCoeffs.at<double>(2), p2 = distCoeffs.at<double>(3);
+
+  const double radial = 1.0 + k1 * m2 + k2 * m2 * m2;
+  const double xd = mx * radial + 2.0 * p1 * mx * my + p2 * (m2 + 2.0 * mx * mx);
+  const double yd = my * radial + p1 * (m2 + 2.0 * my * my) + 2.0 * p2 * mx * my;
+
+  pixel.x = cameraMatrix.at<double>(0, 0) * xd + cameraMatrix.at<double>(0, 2);
+  pixel.y = cameraMatrix.at<double>(1, 1) * yd + cameraMatrix.at<double>(1, 2);
+  return std::isfinite(pixel.x) && std::isfinite(pixel.y);
+}
+
+// 像素 -> 相机系单位射线。分两步：
+//   1) 不动点迭代剥掉 radtan，得到 m = (mx, my)（与 OpenCV 针孔 undistortPoints 同款）；
+//   2) 用 m = sin(theta)/(cos(theta)+xi) 的闭式反解求 theta：
+//        sin(theta) - m*cos(theta) = m*xi  =>  sqrt(1+m^2)*sin(theta - atan(m)) = m*xi
+//      =>  theta = atan(m) + asin(m*xi/sqrt(1+m^2))。
+//      m(theta) 在有效域内单调，因此该解唯一。
+bool omniUnprojectPixel(double u, double v, const cv::Mat& cameraMatrix, double xi,
+                        const cv::Mat& distCoeffs, double max_theta_deg, cv::Point3d& ray)
+{
+  const double fx = cameraMatrix.at<double>(0, 0), fy = cameraMatrix.at<double>(1, 1);
+  const double cx = cameraMatrix.at<double>(0, 2), cy = cameraMatrix.at<double>(1, 2);
+  const double k1 = distCoeffs.at<double>(0), k2 = distCoeffs.at<double>(1);
+  const double p1 = distCoeffs.at<double>(2), p2 = distCoeffs.at<double>(3);
+
+  const double xd_target = (u - cx) / fx;
+  const double yd_target = (v - cy) / fy;
+  if (!std::isfinite(xd_target) || !std::isfinite(yd_target)) return false;
+
+  double mx = xd_target, my = yd_target;
+  for (int i = 0; i < 50; ++i)
+  {
+    const double r2 = mx * mx + my * my;
+    const double icdist = 1.0 / (1.0 + (k2 * r2 + k1) * r2);
+    const double dx = 2.0 * p1 * mx * my + p2 * (r2 + 2.0 * mx * mx);
+    const double dy = p1 * (r2 + 2.0 * my * my) + 2.0 * p2 * mx * my;
+    const double nx = (xd_target - dx) * icdist;
+    const double ny = (yd_target - dy) * icdist;
+    const double step = std::hypot(nx - mx, ny - my);
+    mx = nx;
+    my = ny;
+    if (!std::isfinite(mx) || !std::isfinite(my)) return false;
+    if (step < 1e-15) break;
+  }
+
+  const double m = std::hypot(mx, my);
+  if (m < 1e-12)
+  {
+    ray = cv::Point3d(0.0, 0.0, 1.0);
+    return true;
+  }
+
+  const double s = m * xi / std::sqrt(1.0 + m * m);
+  if (std::abs(s) > 1.0) return false;  // 像素落在模型有效域之外
+  const double theta = std::atan(m) + std::asin(s);
+  if (theta * 180.0 / CV_PI > max_theta_deg + 1e-9) return false;
+
+  const double sin_theta = std::sin(theta);
+  ray = cv::Point3d(sin_theta * mx / m, sin_theta * my / m, std::cos(theta));
+  return std::isfinite(ray.x) && std::isfinite(ray.y) && std::isfinite(ray.z);
+}
+
+// 把 omni 模型近似转换成等距/Kannala-Brandt 模型，供 FAST-LIVO2 的 EquidistantCamera
+// 使用（vikit 里没有 Mei 模型）。做法：在 (0, theta_fit] 上采样 omni 的径向曲线，
+// 对 r(theta)/theta 关于 theta^2 做最小二乘：
+//   r(theta)/theta = fx_kb * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
+// 这是线性最小二乘，直接解 5x5 正规方程。残差主要来自 radtan 的切向项 p1/p2 ——
+// KB 是纯径向模型，表达不了切向，实测外参误差量级见 README。
+bool omniToEquidistantApprox(double xi, double fx, double fy, double k1, double k2,
+                             double theta_fit_deg,
+                             double& fx_kb, double& fy_kb, double k_kb[4])
+{
+  const double theta_max = std::max(1e-6, theta_fit_deg) * CV_PI / 180.0;
+  const int samples = 2000;
+
+  Eigen::Matrix<double, 5, 5> A = Eigen::Matrix<double, 5, 5>::Zero();
+  Eigen::Matrix<double, 5, 1> b = Eigen::Matrix<double, 5, 1>::Zero();
+  for (int i = 1; i <= samples; ++i)
+  {
+    const double theta = theta_max * i / samples;
+    const double denom = std::cos(theta) + xi;
+    if (!(denom > 0.0)) return false;
+    const double m = std::sin(theta) / denom;
+    const double m2 = m * m;
+    const double r_px = fx * m * (1.0 + k1 * m2 + k2 * m2 * m2);
+    const double y = r_px / theta;
+    const double t2 = theta * theta;
+    Eigen::Matrix<double, 5, 1> phi;
+    phi << 1.0, t2, t2 * t2, t2 * t2 * t2, t2 * t2 * t2 * t2;
+    A += phi * phi.transpose();
+    b += phi * y;
+  }
+
+  const Eigen::Matrix<double, 5, 1> c = A.ldlt().solve(b);
+  if (!c.allFinite() || !(c(0) > 0.0)) return false;
+
+  fx_kb = c(0);
+  fy_kb = c(0) * fy / fx;
+  for (int i = 0; i < 4; ++i) k_kb[i] = c(i + 1) / c(0);
+  return true;
+}
+
 // 读取参数
 Params loadParameters(ros::NodeHandle &nh) {
   Params params;
   nh.param("camera_model", params.camera_model, string("pinhole"));
   params.camera_model = normalizeCameraModel(params.camera_model);
-  const double default_fisheye_max_theta_deg = 89.0;
-  nh.param("fisheye_max_theta_deg", params.fisheye_max_theta_deg,
-           default_fisheye_max_theta_deg);
+  // 离轴角上限：鱼眼与 omni 共用。新键名 max_theta_deg 优先，fisheye_max_theta_deg
+  // 作为既有配置的别名继续可用。
+  const double default_max_theta_deg = 89.0;
+  double max_theta_deg = default_max_theta_deg;
+  if (!nh.getParam("max_theta_deg", max_theta_deg)) {
+    nh.param("fisheye_max_theta_deg", max_theta_deg, default_max_theta_deg);
+  }
+  params.fisheye_max_theta_deg = max_theta_deg;
   nh.param("camera_width", params.camera_width, 0);
   nh.param("camera_height", params.camera_height, 0);
   nh.param("fx", params.fx, 1215.31801774424);
@@ -200,6 +405,15 @@ Params loadParameters(ros::NodeHandle &nh) {
     }
   } else if (has_k3 || has_k4) {
     ROS_WARN("[Config] k3/k4 are only used when camera_model is fisheye; ignoring them.");
+  }
+  // omni（Mei 统一模型）的 mirror 参数；xi = 0 退化为针孔。
+  params.xi = 0.0;
+  const bool has_xi = nh.getParam("xi", params.xi);
+  if (isOmniCameraModel(params) && !has_xi) {
+    ROS_ERROR("[Config] camera_model is omni but xi is not set; xi stays 0.0, which "
+              "degenerates the omni model to a pinhole camera.");
+  } else if (!isOmniCameraModel(params) && has_xi) {
+    ROS_WARN("[Config] xi is only used when camera_model is omni; ignoring it.");
   }
   nh.param("marker_size", params.marker_size, 0.2);
   nh.param("delta_width_qr_center", params.delta_width_qr_center, 0.55);
@@ -279,7 +493,7 @@ bool validateCameraCalibrationForImage(const Params& params,
 {
   const CameraModel camera_model = parseCameraModel(params.camera_model);
   if (camera_model == CameraModel::Unknown) {
-    error = "camera_model must be 'pinhole' or 'fisheye' (got '" +
+    error = "camera_model must be 'pinhole', 'fisheye' or 'omni' (got '" +
             params.camera_model + "')";
     return false;
   }
@@ -322,6 +536,45 @@ bool validateCameraCalibrationForImage(const Params& params,
       error = "fisheye distortion k1..k4 make the Kannala-Brandt radius "
               "non-monotonic up to fisheye_max_theta_deg; the fisheye model "
               "cannot be inverted";
+      return false;
+    }
+  } else if (camera_model == CameraModel::Omni) {
+    if (!std::isfinite(params.xi)) {
+      error = "omni mirror parameter xi must be finite";
+      return false;
+    }
+    if (params.xi <= -1.0) {
+      error = "omni xi must be greater than -1; otherwise the projection "
+              "denominator Z + xi*||P|| has no positive range";
+      return false;
+    }
+    if (!std::isfinite(params.k1) || !std::isfinite(params.k2) ||
+        !std::isfinite(params.p1) || !std::isfinite(params.p2)) {
+      error = "omni radtan coefficients k1/k2/p1/p2 must be finite";
+      return false;
+    }
+    const double model_limit_deg = omniThetaLimitDeg(params.xi);
+    if (model_limit_deg < 1.0) {
+      error = "omni xi leaves no usable field of view";
+      return false;
+    }
+    if (params.fisheye_max_theta_deg > model_limit_deg + 1e-9) {
+      ROS_WARN("[Config] max_theta_deg = %.2f deg exceeds the omni model limit "
+               "%.2f deg for xi = %.9f; clamping to the model limit.",
+               params.fisheye_max_theta_deg, model_limit_deg, params.xi);
+    }
+    const double usable_theta_deg =
+        omniUsableThetaDeg(params.xi, params.fisheye_max_theta_deg);
+    if (usable_theta_deg < 1.0) {
+      error = "omni usable field of view is smaller than 1 deg";
+      return false;
+    }
+    if (!omniRadiusModelIsMonotonic(params.xi, params.k1, params.k2,
+                                    usable_theta_deg)) {
+      std::ostringstream oss;
+      oss << "omni radtan k1/k2 make the normalized radius non-monotonic up to "
+          << usable_theta_deg << " deg; the omni model cannot be inverted";
+      error = oss.str();
       return false;
     }
   } else if (!std::isfinite(params.k1) || !std::isfinite(params.k2) ||
@@ -487,6 +740,72 @@ bool undistortFisheyeObservations(const std::vector<std::vector<cv::Point2f>>& c
         keep = false;
         break;
       }
+    }
+    if (!keep) {
+      corners_virt[m].clear();
+      continue;
+    }
+    marker_valid[m] = 1;
+    any_kept = true;
+  }
+  return any_kept;
+}
+
+// omni 版本：与 undistortFisheyeObservations 同构（同样的整块 marker 过滤 + 投到与 K
+// 同尺度的虚拟针孔平面），只是把反解换成 omni 模型。判据同样用归一化半径：
+// 超过 omniRadiusLimit 的角点落在模型有效域之外（回折点或分母过零点之后），
+// 反解会给出看似正常、实际错误的射线，必须整块丢弃。
+// 额外约束：虚拟针孔平面要求射线 z > 0，因此离轴角超过 90 度的角点也无法参与位姿估计
+// （此时 max_theta_deg 必须配置为 <= 90，否则该 marker 会被丢掉并给出提示）。
+bool undistortOmniObservations(const std::vector<std::vector<cv::Point2f>>& corners_raw,
+                               const cv::Mat& cameraMatrix, double xi,
+                               const cv::Mat& distCoeffs, double max_theta_deg,
+                               std::vector<std::vector<cv::Point2f>>& corners_virt,
+                               std::vector<char>& marker_valid)
+{
+  corners_virt.assign(corners_raw.size(), std::vector<cv::Point2f>());
+  marker_valid.assign(corners_raw.size(), 0);
+
+  cv::Mat K, D;
+  cameraMatrix.convertTo(K, CV_64F);
+  distCoeffs.convertTo(D, CV_64F);
+  if (K.rows != 3 || K.cols != 3 || D.total() != 4) {
+    ROS_ERROR("[Omni] camera matrix must be 3x3 and distortion must have exactly "
+              "4 radtan coefficients [k1 k2 p1 p2]");
+    return false;
+  }
+
+  const double fx = K.at<double>(0, 0), fy = K.at<double>(1, 1);
+  const double cx = K.at<double>(0, 2), cy = K.at<double>(1, 2);
+  const double usable_theta_deg = omniUsableThetaDeg(xi, max_theta_deg);
+  const double radius_limit = omniRadiusLimit(xi, D.at<double>(0), D.at<double>(1),
+                                              usable_theta_deg);
+
+  bool any_kept = false;
+  for (size_t m = 0; m < corners_raw.size(); ++m) {
+    bool keep = corners_raw[m].size() == 4;
+    for (size_t c = 0; keep && c < corners_raw[m].size(); ++c) {
+      const double xd = (static_cast<double>(corners_raw[m][c].x) - cx) / fx;
+      const double yd = (static_cast<double>(corners_raw[m][c].y) - cy) / fy;
+      if (!std::isfinite(xd) || !std::isfinite(yd) ||
+          std::hypot(xd, yd) > radius_limit) {
+        keep = false;
+      }
+    }
+    if (!keep) continue;
+
+    corners_virt[m].resize(corners_raw[m].size());
+    for (size_t c = 0; c < corners_raw[m].size(); ++c) {
+      cv::Point3d ray;
+      if (!omniUnprojectPixel(corners_raw[m][c].x, corners_raw[m][c].y, K, xi, D,
+                              usable_theta_deg, ray) ||
+          !(ray.z > 1e-9)) {
+        keep = false;
+        break;
+      }
+      // 投到与 K 同尺度的虚拟针孔平面：p = (fx*X/Z + cx, fy*Y/Z + cy)
+      corners_virt[m][c] = cv::Point2f(static_cast<float>(fx * ray.x / ray.z + cx),
+                                       static_cast<float>(fy * ray.y / ray.z + cy));
     }
     if (!keep) {
       corners_virt[m].clear();
@@ -756,6 +1075,76 @@ void projectPointCloudToImageFisheye(const pcl::PointCloud<Common::Point>::Ptr& 
   }
 }
 
+// omni（Mei 统一模型）版本：把 LiDAR 点直接投影到**原始**图像上。
+// 与 projectPointCloudToImageFisheye 的区别：
+//   * 模型换成 m = (X/(Z+xi*||P||), Y/(Z+xi*||P||)) + radtan；
+//   * 丢弃条件不同：鱼眼丢 z <= 0，omni 丢"落在模型有效域之外"的点。omni 的有效域可以
+//     超过 90 度（xi > 1 时上限是 acos(-1/xi)，本例约 113 度），这类点仍然有唯一的像素，
+//     只有越过回折点或分母过零点的点才会落到镜像分支上，必须丢弃。
+void projectPointCloudToImageOmni(const pcl::PointCloud<Common::Point>::Ptr& cloud,
+  const Eigen::Matrix4f& transformation,
+  const cv::Mat& cameraMatrix,
+  double xi,
+  const cv::Mat& distCoeffs,
+  const cv::Mat& image,
+  double max_theta_deg,
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr& colored_cloud)
+{
+  colored_cloud->clear();
+  colored_cloud->reserve(cloud->size());
+
+  cv::Mat K, D;
+  cameraMatrix.convertTo(K, CV_64F);
+  distCoeffs.convertTo(D, CV_64F);
+  if (K.rows != 3 || K.cols != 3 || D.total() != 4) {
+    ROS_ERROR("[Omni] camera matrix must be 3x3 and distortion must have exactly "
+              "4 radtan coefficients [k1 k2 p1 p2]");
+    return;
+  }
+
+  const int image_width = image.cols;
+  const int image_height = image.rows;
+  const double usable_theta_deg = omniUsableThetaDeg(xi, max_theta_deg);
+  size_t dropped = 0;
+
+  for (const auto& point : *cloud) {
+    const Eigen::Vector4f homogeneous_point(point.x, point.y, point.z, 1.0f);
+    const Eigen::Vector4f transformed_point = transformation * homogeneous_point;
+
+    cv::Point2d pixel;
+    if (!omniProjectPoint(cv::Point3d(transformed_point(0), transformed_point(1),
+                                      transformed_point(2)),
+                          K, xi, D, usable_theta_deg, pixel)) {
+      ++dropped;
+      continue;
+    }
+
+    const int u = static_cast<int>(std::lround(pixel.x));
+    const int v = static_cast<int>(std::lround(pixel.y));
+    if (u >= 0 && u < image_width && v >= 0 && v < image_height) {
+      const cv::Vec3b color = image.at<cv::Vec3b>(v, u);
+
+      pcl::PointXYZRGB colored_point;
+      colored_point.x = transformed_point(0);
+      colored_point.y = transformed_point(1);
+      colored_point.z = transformed_point(2);
+      colored_point.r = color[2];
+      colored_point.g = color[1];
+      colored_point.b = color[0];
+      colored_cloud->push_back(colored_point);
+    }
+  }
+
+  if (DEBUG) {
+    std::cout << BOLDYELLOW << "[Projection] omni (xi=" << xi << "): " << BOLDWHITE
+              << cloud->size() << BOLDYELLOW << " points in, " << BOLDWHITE
+              << colored_cloud->size() << BOLDYELLOW << " colored inside the image ("
+              << image_width << "x" << image_height << "), " << BOLDWHITE << dropped
+              << BOLDYELLOW << " dropped outside the model domain (" << usable_theta_deg
+              << " deg)" << RESET << std::endl;
+  }
+}
+
 // 记录一帧 LiDAR 圆心与 QR 圆心配对结果，便于离线检查
 void saveTargetHoleCenters(const pcl::PointCloud<pcl::PointXYZ>::Ptr& lidar_centers,
                       const pcl::PointCloud<pcl::PointXYZ>::Ptr& qr_centers,
@@ -822,9 +1211,14 @@ void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transfo
   {
     // 相机模型：FAST-LIVO2 的 vikit camera_loader 用 "EquidistantCamera" 表示
     // Kannala-Brandt 鱼眼（读 k1..k4），"Pinhole" 表示针孔（读 cam_d0..cam_d3）。
+    // omni（Mei 统一模型）在 vikit 里没有对应模型，写成 "OmniCamera" + xi，
+    // 并在文件末尾附一组等距近似参数供 EquidistantCamera 直接使用。
     const bool fisheye_camera = isFisheyeCameraModel(params);
+    const bool omni_camera = isOmniCameraModel(params);
+    const char* model_name = omni_camera ? "OmniCamera"
+                                        : (fisheye_camera ? "EquidistantCamera" : "Pinhole");
     outFile << "# FAST-LIVO2 calibration format\n";
-    outFile << "cam_model: " << (fisheye_camera ? "EquidistantCamera" : "Pinhole") << "\n";
+    outFile << "cam_model: " << model_name << "\n";
     outFile << "cam_width: " << img_input.cols << "\n";
     outFile << "cam_height: " << img_input.rows << "\n";
     outFile << "scale: 1.0\n";
@@ -832,7 +1226,14 @@ void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transfo
     outFile << "cam_fy: " << params.fy << "\n";
     outFile << "cam_cx: " << params.cx << "\n";
     outFile << "cam_cy: " << params.cy << "\n";
-    if (fisheye_camera) {
+    if (omni_camera) {
+      // radtan 施加在 m = (X/(Z+xi*||P||), Y/(Z+xi*||P||)) 上，不是 X/Z
+      outFile << "xi: " << params.xi << "\n";
+      outFile << "cam_d0: " << params.k1 << "\n";
+      outFile << "cam_d1: " << params.k2 << "\n";
+      outFile << "cam_d2: " << params.p1 << "\n";
+      outFile << "cam_d3: " << params.p2 << "\n";
+    } else if (fisheye_camera) {
       outFile << "k1: " << params.k1 << "\n";
       outFile << "k2: " << params.k2 << "\n";
       outFile << "k3: " << params.k3 << "\n";
@@ -851,6 +1252,32 @@ void saveCalibrationResults(const Params& params, const Eigen::Matrix4f& transfo
 
     outFile << "Pcl: [";
     outFile << std::setw(10) << transformation(0, 3) << ", " << std::setw(10) << transformation(1, 3) << ", " << std::setw(10) << transformation(2, 3) << "]\n";
+
+    if (omni_camera) {
+      // vikit 里没有 Mei 模型，附一组等距/KB 近似参数，方便直接用 EquidistantCamera 跑。
+      // 该转换丢掉了 radtan 的切向项，是近似值（误差量级见 README 的 omni 一节）。
+      const double theta_fit_deg = std::min(90.0, omniThetaLimitDeg(params.xi));
+      double fx_kb = 0.0, fy_kb = 0.0, k_kb[4] = {0.0, 0.0, 0.0, 0.0};
+      if (theta_fit_deg > 1.0 &&
+          omniToEquidistantApprox(params.xi, params.fx, params.fy, params.k1, params.k2,
+                                  theta_fit_deg, fx_kb, fy_kb, k_kb)) {
+        outFile << "\n# ---- 以下为近似值，仅供 FAST-LIVO2 的 EquidistantCamera 使用 ----\n";
+        outFile << "# 由 omni 模型在 0.." << theta_fit_deg << " deg 上拟合得到，"
+                << "丢掉了 radtan 的切向项 p1/p2，不是精确等价。\n";
+        outFile << "# cam_model: EquidistantCamera\n";
+        outFile << "# cam_fx: " << fx_kb << "\n";
+        outFile << "# cam_fy: " << fy_kb << "\n";
+        outFile << "# cam_cx: " << params.cx << "\n";
+        outFile << "# cam_cy: " << params.cy << "\n";
+        outFile << "# k1: " << k_kb[0] << "\n";
+        outFile << "# k2: " << k_kb[1] << "\n";
+        outFile << "# k3: " << k_kb[2] << "\n";
+        outFile << "# k4: " << k_kb[3] << "\n";
+      } else {
+        ROS_WARN("[Result] failed to derive the equidistant approximation for the omni "
+                 "camera; only the native omni block was written.");
+      }
+    }
 
     outFile.close();
     std::cout << BOLDYELLOW << "[Result] Single-scene calibration results saved to " << BOLDWHITE << outputDir << "single_calib_result.txt" << RESET << std::endl;

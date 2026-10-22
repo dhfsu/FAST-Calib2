@@ -1,48 +1,81 @@
 # Camera intrinsics
-  # Camera model: pinhole (default) or fisheye.
+  # Camera model: pinhole (default), fisheye or omni.
   # "fisheye" is the Kannala-Brandt / equidistant model (cv::fisheye, Kalibr
   # "equidistant", FAST-LIVO2 EquidistantCamera) with 4 coefficients k1..k4.
+  # "omni" is the Mei unified model (Kalibr "omni-radtan", cv::omnidir,
+  # camodocal CataCamera): one mirror parameter xi plus radtan k1/k2/p1/p2.
   # Accepted aliases: equidistant, EquidistantCamera, kb4, kannala_brandt,
-  # opencv_fisheye (case-insensitive). Any other value is rejected at startup.
-  camera_model: pinhole
-  # Resolution used when calibrating the active intrinsics below.
-  # For a fisheye camera this must be the RAW image resolution.
-  camera_width: 2448
-  camera_height: 2048
-  fx: 2364.049767406230
-  fy: 2368.875165893467
-  cx: 1211.209298385360
-  cy: 1040.561211270159
-  k1: -0.051619025360610
-  k2: 0.125944589327291
-  p1: -0.0002140931408129925
-  p2: 0.0006409200928440982
+  # opencv_fisheye, omni, OmniCamera, mei, unified, omnidir (case-insensitive).
+  # Any other value is rejected at startup.
+  # camera_model: pinhole
+  # # Resolution used when calibrating the active intrinsics below.
+  # # For a fisheye camera this must be the RAW image resolution.
+  # camera_width: 2448
+  # camera_height: 2048
+  # fx: 2364.049767406230
+  # fy: 2368.875165893467
+  # cx: 1211.209298385360
+  # cy: 1040.561211270159
+  # k1: -0.051619025360610
+  # k2: 0.125944589327291
+  # p1: -0.0002140931408129925
+  # p2: 0.0006409200928440982
+  # omni only: the Mei mirror parameter. xi = 0 degenerates to a pinhole camera.
+  # Ignored for the other models.
+  # xi: 2.51429029
   # Fisheye only: the 3rd and 4th Kannala-Brandt coefficients. Ignored for pinhole.
   # (Legacy fisheye configs that kept them in p1/p2 still load, with a warning.)
   # k3: 0.0
   # k4: 0.0
-  # Fisheye only: off-axis cutoff. Markers whose corners lie outside the model's
-  # monotonic range are dropped; wide-angle lenses are usually black there.
-  # fisheye_max_theta_deg: 89.0
+  # Fisheye/omni: off-axis cutoff. Markers whose corners lie outside the model's
+  # invertible range are dropped; wide-angle lenses are usually black there.
+  # For omni the cutoff is additionally clamped to the model limit acos(-1/xi)
+  # (113.4 deg for the example below), beyond which pixels no longer map to a
+  # unique ray.
+  # max_theta_deg: 89.0        # new name, applies to both wide-angle models
+  # fisheye_max_theta_deg: 89.0  # legacy alias, still accepted
 
 # ===== Fisheye camera example (vanjee, 4000x3000, Kannala-Brandt) =====
 # Fill in the intrinsics from scripts/calibrate_fisheye_intrinsics.py
 # (its equidistant.yaml holds fx, fy, cx, cy and k1..k4), then replace the block
 # above with:
-#   camera_model: fisheye
-#   camera_width: 4000
-#   camera_height: 3000
-#   fx: 792.4057085207388
-#   fy: 792.3582580692001
-#   cx: 2004.5367643055422
-#   cy: 1500.454819537657
-#   k1:  0.09095816477283435
-#   k2: -0.02448764621169176
-#   k3:  0.008319662193425007
-#   k4: -0.0036367895734679048
-#   fisheye_max_theta_deg: 89.0
-# and point lidar_topic/bag_path/image_path at the fisheye rig, e.g.
-#   lidar_topic: "/vanjee_points722"
+  # camera_model: fisheye
+  # camera_width: 4000
+  # camera_height: 3000
+  # fx: 794.4112180000000
+  # fy: 794.4112180000000
+  # cx: 2000.5818810000001
+  # cy: 1492.9195150000000
+  # k1: 0.08030415090000000
+  # k2: -0.00769975350000000
+  # k3: -0.00588536510000000
+  # k4: 0.00054278710000000
+  # fisheye_max_theta_deg: 89.0
+#and point lidar_topic/bag_path/image_path at the fisheye rig, e.g.
+  # lidar_topic: "/vanjee_points722"
+
+# ===== omni camera example (Mei unified model, Kalibr "omni-radtan") =====
+# Differences from the fisheye block above:
+#   * one extra mirror parameter xi;
+#   * the distortion is radtan [k1 k2 p1 p2] applied to
+#     m = (X/(Z+xi*||P||), Y/(Z+xi*||P||)) -- NOT to X/Z -- so k1 is not
+#     comparable to a pinhole k1 (here 1.30 vs the usual 0.0x);
+#   * the usable field of view is capped by the model at acos(-1/xi)
+#     (113.4 deg for xi = 2.514), where the projection folds back.
+# Replace the fisheye block above with this one to switch models.
+  camera_model: omni
+  camera_width: 4000
+  camera_height: 3000
+  fx: 2807.01306999
+  fy: 2797.89971093
+  cx: 1989.46523453
+  cy: 1496.79906500
+  xi: 2.51429029
+  k1: 1.30034009
+  k2: 0.07687779
+  p1: 0.00327167
+  p2: -0.00028419
+  max_theta_deg: 89.0
 
 # Calibration target parameters
   marker_size: 0.20 # ArUco marker side length; adjust to match your physical target
@@ -60,17 +93,25 @@
   annulus_voxel_leaf: 0.005
   auto_roi_geometry_max_error: 0.10
 
-  use_auto_lidar_roi: true
+  use_auto_lidar_roi: false
+# range values in order:
+  x_min: -1.7
+  x_max: -0.2
+  y_min: 1.8
+  y_max: 2.7
+  z_min: -0.5
+  z_max: 0.5
+
 
 # Input
   # LiDAR mounting axes. Each value answers which signed native LiDAR axis
   # points in that physical direction. Left is derived as up x forward.
   # Bundled AVIA data uses the standard +X-forward, +Y-left, +Z-up mounting.
-  lidar_forward_axis: "+x"
+  lidar_forward_axis: "+y"
   lidar_up_axis: "+z"
-  lidar_topic: "/livox/lidar"
-  bag_path: "$(find fast_calib)/calib_data/avia/mid.bag"
-  image_path: "$(find fast_calib)/calib_data/avia/mid.bmp"
+  lidar_topic: "/vanjee_points722"
+  bag_path: "/root/catkin_ws/vanjeeDataset/skew-cam/cam4_left_1_trim.bag"
+  image_path: "/root/catkin_ws/vanjeeDataset/skew-cam/cam4_left_1.jpg"
 
 # Output
   output_path: "$(find fast_calib)/output"

@@ -149,7 +149,14 @@ int main(int argc, char **argv)
     std::cout << BOLDCYAN << std::fixed << std::setprecision(6) << transformation << RESET << std::endl;
 
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-    if (isFisheyeCameraModel(params))
+    if (isOmniCameraModel(params))
+    {
+      // omni：直接投到原始图像，不做整幅去畸变
+      projectPointCloudToImageOmni(cloud_input, transformation, qrDetectPtr->cameraMatrix_,
+                                   params.xi, qrDetectPtr->distCoeffs_, img_input,
+                                   params.fisheye_max_theta_deg, colored_cloud);
+    }
+    else if (isFisheyeCameraModel(params))
     {
       // 鱼眼：直接投到原始鱼眼图，不做整幅去畸变
       projectPointCloudToImageFisheye(cloud_input, transformation, qrDetectPtr->cameraMatrix_,

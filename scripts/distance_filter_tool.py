@@ -323,7 +323,8 @@ if __name__ == "__main__":
         pcd_path = convert_pointcloud2_bag_to_pcd(
             bag_file=bag_file,
             output_dir=output_dir,
-            topic_name="/hesai/pandar",  # 如有不同，可改成 topic 名称
+            # topic_name="/hesai/pandar",  # 如有不同，可改成 topic 名称
+            topic_name="/vanjee_points722",  # 如有不同，可改成 topic 名称
             pcd_name="sensor_PointCloud2_inten_ascii.pcd"
         )
     else:  # "CustomMsg"

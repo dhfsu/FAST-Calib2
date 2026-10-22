@@ -99,27 +99,44 @@ Typical multi-scene target placement:
   <font color=#a0a0a0 size=2>Placement of the calibration target for multi-scene data collection: (a) facing forward, (b) oriented to the right, (c) oriented to the left.</font>
 </p>
 
-### Fisheye cameras
+### Fisheye and omni cameras
 
-Both camera models are supported and selected with `camera_model` in `config/qr_params.yaml`:
+Three camera models are supported and selected with `camera_model` in `config/qr_params.yaml`:
 
 | `camera_model` | Model | Coefficients |
 | --- | --- | --- |
 | `pinhole` (default) | pinhole + radial-tangential | `k1, k2, p1, p2` |
 | `fisheye` | Kannala-Brandt / equidistant (`cv::fisheye`) | `k1, k2, k3, k4` |
+| `omni` | Mei unified model (`xi` + radtan) | `xi`, `k1, k2, p1, p2` |
 
 `fisheye` uses the same convention as OpenCV's `cv::fisheye`, Kalibr's `equidistant` and
 FAST-LIVO2's `EquidistantCamera`. `camera_model` also accepts `equidistant`,
 `EquidistantCamera`, `kb4`, `kannala_brandt` and `opencv_fisheye` (case-insensitive).
-Any other value is rejected at startup rather than being silently treated as a pinhole camera.
 
-For a fisheye camera the image is used **raw**: ArUco corners are detected on the original
-fisheye image, mapped onto a virtual pinhole plane, and only then used for the board pose.
-LiDAR points are likewise projected into the raw fisheye image for the colored cloud.
-Marker corners whose off-axis angle exceeds `fisheye_max_theta_deg` (default `89`) are
-dropped, since the Kannala-Brandt model cannot be inverted reliably outside its monotonic
-range — wide-angle lenses are usually already black there. Detection requires at least
-`min_detected_markers` (default 3) markers to remain after that filtering.
+`omni` is the Mei unified model — Kalibr's `omni-radtan`, OpenCV's `cv::omnidir` and
+camodocal's `CataCamera` — with the projection
+
+```
+m = (X / (Z + xi*||P||), Y / (Z + xi*||P||)),   then radtan k1, k2, p1, p2
+```
+
+Note that the radtan coefficients are applied to `m`, **not** to `X/Z`, so `k1` is not
+comparable to a pinhole `k1` (values around 1.0 are normal). `camera_model` also accepts
+`OmniCamera`, `mei`, `MeiCamera`, `unified` and `omnidir`. `ocam` is deliberately **not**
+accepted: FAST-LIVO2's `OmniCamera` is Scaramuzza's polynomial model, which is a different
+parameterisation. Any unrecognised value is rejected at startup rather than being silently
+treated as a pinhole camera.
+
+For a fisheye or omni camera the image is used **raw**: ArUco corners are detected on the
+original image, mapped onto a virtual pinhole plane, and only then used for the board pose.
+LiDAR points are likewise projected into the raw image for the colored cloud.
+Marker corners whose off-axis angle exceeds the cutoff are dropped, since neither model can
+be inverted reliably outside its invertible range — wide-angle lenses are usually already
+black there. The cutoff is `max_theta_deg` (default `89`; the legacy name
+`fisheye_max_theta_deg` still works). For omni it is additionally clamped to the model limit
+`acos(-1/xi)` — 113.4 deg for `xi = 2.514` — beyond which the projection folds back and a
+pixel no longer maps to a unique ray. Detection requires at least `min_detected_markers`
+(default 3) markers to remain after that filtering.
 
 Steps:
 
@@ -147,6 +164,27 @@ Wide-angle lenses need the target to stay inside the valid image circle; a board
 the black corners of a fisheye frame cannot be calibrated. The `qr_detect.png` written to
 the output folder shows the detected markers, the reprojected annulus centers and the board
 axes, which is the quickest way to confirm that the fisheye intrinsics are correct.
+
+### Omni cameras
+
+Use the intrinsics exactly as Kalibr's `camchain.yaml` reports them (`intrinsics:
+[xi, fx, fy, cx, cy]`, `distortion_coeffs: [k1, k2, p1, p2]`) and set
+`camera_model: omni`. A worked example is kept in `config/qr_params.yaml`. The image
+resolution must match `camera_width`/`camera_height` as usual.
+
+Two notes on the output file:
+
+* The camera block is written as `cam_model: OmniCamera` with `xi` and
+  `cam_d0..cam_d3` (radtan). FAST-LIVO2's vikit has no Mei camera, so this block is not
+  directly consumable by stock FAST-LIVO2.
+* For that reason the file additionally carries a **commented** `EquidistantCamera` block,
+  obtained by fitting the Kannala-Brandt radial polynomial to the omni radial curve over
+  `0..90 deg`. The radial part of the conversion is essentially exact (residual below
+  0.03 px), but Kannala-Brandt cannot represent the tangential terms `p1`/`p2`. On a real
+  4000x3000 dataset that residual shifts the calibrated extrinsic by about **3 mm** in
+  translation and **0.17 deg** in rotation relative to the native omni run — small next to
+  FAST-Calib2's own cm-level accuracy, but systematic, so it does not average out over
+  multiple scenes. Use `camera_model: omni` if you want the exact model.
 
 ## 5. Standalone LiDAR Center Extraction Test
 

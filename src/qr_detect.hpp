@@ -6,9 +6,10 @@ which is included as part of this source code package.
 
 相机模型由 Params::camera_model 选择：
   * pinhole（默认）：沿用原实现，cv::aruco 直接用真实内参和 1x5 radtan 畸变；
-  * fisheye：Kannala-Brandt（cv::fisheye，k1..k4）。先按模型有效域整块过滤 marker，
-    再把原始鱼眼角点投到与 K 同尺度的虚拟针孔平面，之后用同一套 estimatePoseBoard
-    求位姿；调试绘制直接画在原始鱼眼图上。
+  * fisheye：Kannala-Brandt（cv::fisheye，k1..k4）；
+  * omni：Mei 统一模型（xi + radtan k1/k2/p1/p2）。
+  后两者都先按模型有效域整块过滤 marker，再把原始图像上的角点投到与 K 同尺度的虚拟
+  针孔平面，之后用同一套 estimatePoseBoard 求位姿；调试绘制直接画在原始图像上。
 */
 
 #ifndef QR_DETECT_HPP
@@ -27,8 +28,10 @@ class QRDetect
     double delta_width_circles_, delta_height_circles_;
     int min_detected_markers_;
     cv::Ptr<cv::aruco::Dictionary> dictionary_;
-    bool fisheye_;                  // 相机模型是否为鱼眼
-    double fisheye_max_theta_deg_;  // 鱼眼角点可用的离轴角上限
+    bool fisheye_;         // 相机模型是否为鱼眼（Kannala-Brandt）
+    bool omni_;            // 相机模型是否为 omni（Mei 统一模型）
+    double xi_;            // omni 的 mirror 参数
+    double max_theta_deg_; // 鱼眼/omni 角点可用的离轴角上限
 
   public:
     ros::Publisher qr_pub_;
@@ -46,9 +49,26 @@ class QRDetect
       delta_height_circles_ = params.delta_height_circles;
       min_detected_markers_ = params.min_detected_markers;
       fisheye_ = isFisheyeCameraModel(params);
-      fisheye_max_theta_deg_ = params.fisheye_max_theta_deg;
+      omni_ = isOmniCameraModel(params);
+      xi_ = params.xi;
+      max_theta_deg_ = params.fisheye_max_theta_deg;
 
-      if (fisheye_)
+      if (omni_)
+      {
+        // omni 原始内参：CV_64F 3x3 + 4x1 radtan [k1 k2 p1 p2]，xi 单独存
+        cameraMatrix_ = (cv::Mat_<double>(3, 3) << params.fx, 0, params.cx,
+                                                   0, params.fy, params.cy,
+                                                   0,         0,        1);
+        distCoeffs_ = (cv::Mat_<double>(4, 1) << params.k1, params.k2,
+                                                 params.p1, params.p2);
+        ROS_INFO("[QRDetect] omni (Mei unified) model: fx=%.4f fy=%.4f cx=%.4f cy=%.4f "
+                 "xi=%.9f radtan=[%+.8f %+.8f %+.8f %+.8f] model_limit=%.2f deg "
+                 "max_theta=%.1f deg",
+                 params.fx, params.fy, params.cx, params.cy, params.xi,
+                 params.k1, params.k2, params.p1, params.p2,
+                 omniThetaLimitDeg(params.xi), max_theta_deg_);
+      }
+      else if (fisheye_)
       {
         // 原始鱼眼内参：cv::fisheye 要求畸变恰好是 4 个系数 [k1 k2 k3 k4]
         cameraMatrix_ = (cv::Mat_<double>(3, 3) << params.fx, 0, params.cx,
@@ -60,7 +80,7 @@ class QRDetect
                  "D=[%+.8f %+.8f %+.8f %+.8f] max_theta=%.1f deg",
                  params.fx, params.fy, params.cx, params.cy,
                  params.k1, params.k2, params.k3, params.k4,
-                 fisheye_max_theta_deg_);
+                 max_theta_deg_);
       }
       else
       {
@@ -100,7 +120,7 @@ class QRDetect
                                  cv::Mat& intrinsics_used,
                                  cv::Mat& distCoeffs_used) const
     {
-      if (!fisheye_)
+      if (!fisheye_ && !omni_)
       {
         ids_used = ids;
         corners_used = corners;
@@ -111,8 +131,16 @@ class QRDetect
 
       std::vector<std::vector<cv::Point2f>> corners_virt;
       std::vector<char> marker_valid;
-      undistortFisheyeObservations(corners, cameraMatrix_, distCoeffs_,
-                                   fisheye_max_theta_deg_, corners_virt, marker_valid);
+      if (omni_)
+      {
+        undistortOmniObservations(corners, cameraMatrix_, xi_, distCoeffs_,
+                                  max_theta_deg_, corners_virt, marker_valid);
+      }
+      else
+      {
+        undistortFisheyeObservations(corners, cameraMatrix_, distCoeffs_,
+                                     max_theta_deg_, corners_virt, marker_valid);
+      }
 
       std::vector<int> dropped_ids;
       ids_used.clear();
@@ -136,9 +164,9 @@ class QRDetect
           if (i) oss << ", ";
           oss << dropped_ids[i];
         }
-        ROS_WARN("[QRDetect] Dropped %zu marker(s) outside the fisheye model domain "
-                 "(> %.1f deg): id %s", dropped_ids.size(), fisheye_max_theta_deg_,
-                 oss.str().c_str());
+        ROS_WARN("[QRDetect] Dropped %zu marker(s) outside the %s model domain "
+                 "(> %.1f deg): id %s", dropped_ids.size(),
+                 omni_ ? "omni" : "fisheye", max_theta_deg_, oss.str().c_str());
       }
 
       // 角点已去畸变到虚拟针孔平面，位姿求解用零畸变
@@ -149,6 +177,19 @@ class QRDetect
     // 把一个相机系下的 3D 点投到图像像素（模型相关）
     cv::Point2f projectPointCameraFrame(const cv::Point3f& pt_cam) const
     {
+      if (omni_)
+      {
+        cv::Point2d pixel;
+        if (!omniProjectPoint(cv::Point3d(pt_cam.x, pt_cam.y, pt_cam.z), cameraMatrix_,
+                              xi_, distCoeffs_,
+                              omniUsableThetaDeg(xi_, max_theta_deg_), pixel))
+        {
+          // 有效域之外：返回 NaN，由绘制侧跳过，避免画出回折分支上的假坐标
+          return cv::Point2f(std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<float>::quiet_NaN());
+        }
+        return cv::Point2f(static_cast<float>(pixel.x), static_cast<float>(pixel.y));
+      }
       if (fisheye_)
       {
         vector<Point3f> input{pt_cam};
@@ -166,7 +207,7 @@ class QRDetect
     // 在图像上画出位姿坐标轴（模型相关；鱼眼下 cv::aruco::drawAxis 不适用）
     void drawAxisCameraFrame(const cv::Vec3d& rvec, const cv::Vec3d& tvec, float length) const
     {
-      if (!fisheye_)
+      if (!fisheye_ && !omni_)
       {
         cv::aruco::drawAxis(imageCopy_, cameraMatrix_, distCoeffs_, rvec, tvec, length);
         return;
@@ -193,9 +234,18 @@ class QRDetect
       const cv::Point2f uv_y = projectPointCameraFrame(toCameraFrame(axis_y));
       const cv::Point2f uv_z = projectPointCameraFrame(toCameraFrame(axis_z));
 
-      line(imageCopy_, uv_origin, uv_x, cv::Scalar(0, 0, 255), 2);
-      line(imageCopy_, uv_origin, uv_y, cv::Scalar(0, 255, 0), 2);
-      line(imageCopy_, uv_origin, uv_z, cv::Scalar(255, 0, 0), 2);
+      // omni 下超出有效域的轴端点会返回 NaN，跳过该轴而不是画出错误线段
+      auto draw_axis_segment = [&](const cv::Point2f& a, const cv::Point2f& b,
+                                   const cv::Scalar& color) {
+        if (!std::isfinite(a.x) || !std::isfinite(a.y) ||
+            !std::isfinite(b.x) || !std::isfinite(b.y)) {
+          return;
+        }
+        line(imageCopy_, a, b, color, 2);
+      };
+      draw_axis_segment(uv_origin, uv_x, cv::Scalar(0, 0, 255));
+      draw_axis_segment(uv_origin, uv_y, cv::Scalar(0, 255, 0));
+      draw_axis_segment(uv_origin, uv_z, cv::Scalar(255, 0, 0));
     }
 
     void comb(int N, int K, std::vector<std::vector<int>> &groups) {
